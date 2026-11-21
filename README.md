@@ -1,42 +1,24 @@
-# TOE Public Bot 2.3.0 — webhook + 10-minute outage refresh
+# TOE Public Bot 2.4.0 — live PNG on button, changed-only background alerts
 
-This release separates fast Telegram interaction from schedule refresh:
+## How it works
+- **📊 Мій графік** requests a fresh schedule from the TOE API and sends a PNG image using the mobile-first design based on the supplied reference.
+- Every 10 minutes, GitHub Actions checks the active subscriptions in the background.
+- The background process compares the complete dates and all 48 half-hour slots.
+- If nothing changed, the bot sends nothing and does not edit any previous message.
+- If the schedule really changed, the bot sends one new PNG photo.
+- The first successful background check creates a silent baseline. To see the first image, press **📊 Мій графік**.
+- A manual image request also updates the comparison baseline, preventing a duplicate automatic alert for the same data.
 
-- Cloudflare Worker handles Telegram webhook updates and inline/reply buttons in real time.
-- Cloudflare D1 stores users, their private chat subscriptions and the public TOE address directory.
-- GitHub Actions runs `schedule_job.py` every 10 minutes, downloads/compares outage schedules and sends/edits personalized photos.
-- A separate workflow imports/refreshes the TOE public address directory in D1 weekly and on manual request.
+## Deployment
+Read **DEPLOY_2.4.md** for the Worker token and redeployment steps.
 
-## Full deployment guide
-
-Read `DEPLOY_CLOUDFLARE.md` from top to bottom. Do not use the old 2.1 workflow that runs `python bot.py --once`: it polls Telegram with `getUpdates` and deletes webhook configuration. The new scheduled workflow runs `schedule_job.py` only.
-
-## Live schedule retrieval
-
-Pressing **📊 Мій графік** now fetches the current schedule directly from the official TOE API and sends the current/tomorrow half-hour intervals immediately. The same live fetch is attempted after a new address is activated. Identical address/queue/date requests use a short edge cache to reduce load. The 10-minute GitHub Actions job remains responsible for the designed PNG message and automatic edit/change notifications.
-
-## Button menu
-
-The persistent keyboard always shows all actions, including during address entry. It no longer collapses to only Cancel and Help:
-
-- Add address
-- Change address
-- My schedule
-- Pause/resume notifications
-- Cancel current address entry
-- Help
-
-If the old 2.1 bot showed only Cancel and Help, it was in an unfinished address-entry flow. Press Cancel once or deploy 2.2.0; the new keyboard always exposes the full menu.
-
-## Required GitHub Actions secrets
-
+GitHub Actions secrets:
 - `TELEGRAM_BOT_TOKEN`
-- `CLOUDFLARE_API_TOKEN` — Cloudflare API token with D1 Edit permission for this account
+- `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_D1_DATABASE_ID`
 
-The old `STATE_ENCRYPTION_KEY` is no longer used by the 2.2 architecture. Keep it temporarily until the new setup is verified; after migration, the live subscriptions reside in Cloudflare D1.
+Cloudflare Worker secret:
+- `GITHUB_ACTIONS_TOKEN` — fine-grained PAT, restricted to this repository, with Actions: Read and write.
 
-## Limits and reliability
-
-Telegram button/text updates are delivered to the Worker using a webhook, normally within seconds, subject to Telegram/network/Cloudflare latency. No free provider can guarantee a hard maximum of 5 seconds. Schedule refresh is started by GitHub Actions every 10 minutes; scheduled runs can be delayed. User subscriptions live in D1, not in the public Git repository.
+The PNG renderer uses the Inter font files in `fonts/`.
