@@ -75,7 +75,7 @@ def main() -> None:
     http = requests.Session()
     http.headers.update({"User-Agent": "TOE-Public-Outage-Bot/2.2"})
     cfg = SimpleNamespace(timezone=str(tz), schedule_check_interval_seconds=600)
-    process_subscriptions(tg, state, cfg, tz, http, NoopStore())
+    stats = process_subscriptions(tg, state, cfg, tz, http, NoopStore())
 
     updates = []
     for chat_id, user in users.items():
@@ -107,7 +107,14 @@ def main() -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [checked_at],
     )
-    log.info("Цикл перевірки завершено: %d активних підписок; змінених записів у D1: %d; %s", len(users), len(updates), checked_at)
+    log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, зміни=%d, нові PNG=%d, помилки TOE=%d, помилки Telegram=%d, оновлено D1=%d, час=%s",
+             len(users), stats["fetched"], stats["baselined"], stats["unchanged"],
+             stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"],
+             len(updates), checked_at)
+    if stats["fetch_failed"] or stats["send_failed"]:
+        raise RuntimeError(
+            f"Помилки фонового оновлення: TOE={stats['fetch_failed']}, Telegram={stats['send_failed']}."
+        )
 
 
 if __name__ == "__main__":

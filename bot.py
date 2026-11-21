@@ -474,82 +474,83 @@ def _caption(user: dict[str, Any], checked_at: datetime, status: str) -> str:
 
 
 def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
-                          tz: ZoneInfo, http: requests.Session, store: StateStore) -> None:
+                          tz: ZoneInfo, http: requests.Session, store: StateStore) -> dict[str, int]:
+    """Send a new PNG only when the actual outage slots change."""
     users = state.setdefault("users", {})
     active = [(chat_id, user) for chat_id, user in users.items()
               if user.get("active") and user.get("address_key") and user.get("group")]
+    stats = {"active": len(active), "fetched": 0, "baselined": 0, "unchanged": 0,
+             "changed": 0, "sent": 0, "fetch_failed": 0, "send_failed": 0}
     if not active:
         log.info("Немає активних підписок")
-        return
+        return stats
 
     now = datetime.now(tz)
-    schedule_cache: dict[str, dict[str, dict[str, str]] | Exception] = {}
+    cache: dict[str, dict[str, dict[str, str]] | Exception] = {}
     for chat_id, user in active:
         identity = f"{user['address_key']}|{user['group']}"
-        if identity not in schedule_cache:
+        if identity not in cache:
             try:
                 schedules = fetch_schedule(user["address_key"], user["group"], tz, session=http)
                 if not schedules:
                     raise ToeAPIError("Сайт поки не повернув графік на сьогодні або завтра")
-                schedule_cache[identity] = schedules
+                cache[identity] = schedules
             except Exception as exc:
-                schedule_cache[identity] = exc
+                cache[identity] = exc
 
-        result = schedule_cache[identity]
+        result = cache[identity]
         if isinstance(result, Exception):
+            stats["fetch_failed"] += 1
             user["fail_count"] = int(user.get("fail_count", 0)) + 1
-            log.warning("Schedule fetch failed for subscription %s: %s", identity, result)
-            if user["fail_count"] >= 3 and not user.get("error_notified"):
-                try:
-                    if user.get("snapshot"):
-                        warning = "Показую останній отриманий графік і продовжую спроби. "
-                    else:
-                        warning = "Поки не вдалося отримати перший графік; продовжую спроби. "
-                    _send(tg, chat_id,
-                          "⚠️ <b>Тимчасово не вдається оновити графік.</b>\n"
-                          + warning + "Це не означає, що відключень немає.", user=user)
-                    user["error_notified"] = True
-                except TelegramError:
-                    log.exception("Не вдалося надіслати повідомлення про збій")
+            log.error("Не вдалося перевірити графік %s: %s", identity, result)
             store.save(state)
             continue
 
+        stats["fetched"] += 1
         snapshot = {day: item["slots"] for day, item in sorted(result.items())}
-        old_snapshot = user.get("snapshot") or {}
-        changed = _changed(old_snapshot, snapshot)
-        if not old_snapshot:
-            status = "✅ Перший актуальний графік для цієї підписки."
-        elif changed:
-            status = "🔔 <b>ГРАФІК ЗМІНИВСЯ!</b> Надсилаю оновлення."
-        else:
-            status = "✅ Змін немає — графік перевірено."
-        caption = _caption(user, now, status)
-        png = render_schedule_png(result, user["address_label"], user["group"], now)
+        previous = user.get("snapshot") or {}
 
-        try:
-            message_id = user.get("message_id")
-            if message_id and not changed:
-                try:
-                    tg.edit_photo(chat_id, int(message_id), png, caption)
-                except TelegramError as exc:
-                    if not exc.not_modified and not exc.message_gone:
-                        log.warning("Не вдалося редагувати фото в чаті %s; надсилаю нове: %s", chat_id, exc)
-                        user["message_id"] = tg.send_photo(chat_id, png, caption)
-                    elif exc.message_gone:
-                        user["message_id"] = tg.send_photo(chat_id, png, caption)
-            else:
-                user["message_id"] = tg.send_photo(chat_id, png, caption)
-
+        # First successful fetch is a silent baseline: the first picture is requested by the user.
+        if not previous:
             user["snapshot"] = snapshot
             user["last_ok"] = now.strftime("%d.%m.%Y %H:%M")
             user["fail_count"] = 0
-            if user.get("error_notified"):
-                _send(tg, chat_id, "✅ Зв'язок із сайтом відновлено, графік знову оновлюється.", user=user)
+            stats["baselined"] += 1
+            log.info("Початковий знімок створено без повідомлення: %s", identity)
+            store.save(state)
+            continue
+
+        # Full comparison ignores source timestamps and checks all dates/48 half-hour slots.
+        if snapshot == previous:
+            stats["unchanged"] += 1
+            log.info("Графік не змінився — нічого не надсилаю: %s", identity)
+            continue
+
+        stats["changed"] += 1
+        caption = _caption(user, now, "🔔 <b>ГРАФІК ЗМІНИВСЯ!</b> Надсилаю нове зображення.")
+        png = render_schedule_png(result, user["address_label"], user["group"], now)
+        try:
+            # Do not edit previous messages. A real change always makes a new photo message.
+            message_id = tg.send_photo(chat_id, png, caption)
+            user["message_id"] = message_id
+            user["snapshot"] = snapshot
+            user["last_ok"] = now.strftime("%d.%m.%Y %H:%M")
+            user["fail_count"] = 0
             user["error_notified"] = False
             user["no_schedule_notified"] = False
+            stats["sent"] += 1
+            log.info("Нове PNG після зміни графіка: %s, message_id=%s", identity, message_id)
         except Exception:
-            log.exception("Не вдалося оновити повідомлення підписки для чату %s", chat_id)
+            stats["send_failed"] += 1
+            log.exception("Не вдалося надіслати PNG після зміни графіка: %s", identity)
+            # Keep the old snapshot so the next cycle retries this change.
         store.save(state)
+
+    log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, змінено=%d, "
+             "нових PNG=%d, помилок TOE=%d, помилок Telegram=%d",
+             stats["active"], stats["fetched"], stats["baselined"], stats["unchanged"],
+             stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"])
+    return stats
 
 
 def schedule_check_due(state: dict[str, Any], now_ts: float, interval_seconds: int) -> bool:

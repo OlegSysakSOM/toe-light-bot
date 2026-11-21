@@ -1,0 +1,37 @@
+name: TOE public bot — send graph on request
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: Telegram private chat ID
+        required: true
+        type: string
+concurrency:
+  group: toe-schedule-refresh
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  send-graph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+      - name: Send current PNG
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          TIMEZONE: Europe/Kyiv
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: python on_demand_schedule.py

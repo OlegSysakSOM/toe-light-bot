@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: toe-public-schedule-refresh
+  group: toe-schedule-refresh
   cancel-in-progress: false
 
 permissions:
