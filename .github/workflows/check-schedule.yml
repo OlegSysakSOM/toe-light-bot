@@ -1,4 +1,4 @@
-name: Оновлення графіка відключень
+name: TOE public bot — users and outage schedules
 
 on:
   schedule:
@@ -6,43 +6,48 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: toe-light-schedule
+  group: toe-public-bot
   cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  check-schedule:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
-      - name: Отримати код і попередній стан
+      - name: Checkout repository and encrypted state
         uses: actions/checkout@v4
 
-      - name: Встановити Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
-      - name: Встановити залежності
-        run: pip install -r requirements.txt
+      - name: Restore public TOE address directory cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/toe_address_index.json
+          key: toe-address-index-v1-${{ runner.os }}
 
-      - name: Перевірити графік і оновити Telegram
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Process Telegram users and refresh schedules
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TOE_ADDRESS: ${{ secrets.TOE_ADDRESS }}
           STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
-          GROUP: "5.1"
-          ADDRESS_LABEL: ${{ secrets.ADDRESS_LABEL }}
-          CHECK_INTERVAL_SECONDS: "900"
-          TIMEZONE: Europe/Kyiv
           STATE_FILE: state.enc
-          LOG_FILE: ""
+          ADDRESS_INDEX_FILE: .cache/toe_address_index.json
+          TIMEZONE: Europe/Kyiv
+          MAX_ADDRESS_PAGES: "600"
+          LOG_LEVEL: INFO
         run: python bot.py --once
 
-      - name: Зберегти зашифрований стан для наступного запуску
+      - name: Persist encrypted user subscriptions and update offset
         if: always()
         run: |
           if [ -f state.enc ]; then
@@ -50,7 +55,7 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -f state.enc
             if ! git diff --cached --quiet; then
-              git commit -m "Update encrypted bot state [skip ci]"
+              git commit -m "Persist encrypted bot state [skip ci]"
               git push
             fi
           fi

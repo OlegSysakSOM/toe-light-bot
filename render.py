@@ -1,330 +1,130 @@
-"""Малює картинку з графіком: заокруглені картки, насичені кольори, плитки по годинах.
-
-Запуск `python render.py` створює demo.png на вигадних даних (без інтернету) —
-зручно, щоб оцінити вигляд.
-"""
+"""Render a legible, rounded-corner outage schedule poster with Pillow."""
 from __future__ import annotations
 
-import io
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from functools import lru_cache
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-from toe_api import MAYBE, OFF, ON, DaySchedule, count_minutes, fmt_duration, fmt_range, intervals_of
-
-# ───────────────────────────── стиль ─────────────────────────────
-W = 1080           # ширина підсумкової картинки, px
-SS = 2             # supersampling: малюємо у 2× і зменшуємо → гладкі округлені краї
-PAD = 36
-GAP = 28
-
-BG_TOP, BG_BOT = (8, 12, 32), (28, 22, 74)
-CARD, CARD_BORDER = (21, 29, 64), (48, 60, 116)
-TEXT, MUTED, INK = (246, 248, 255), (153, 166, 210), (9, 14, 38)
-C_ON, C_OFF, C_MAYBE, C_UNKNOWN = (44, 230, 140), (255, 77, 94), (255, 201, 60), (120, 130, 165)
-HEAD_A, HEAD_B = (52, 96, 255), (139, 70, 240)
-C_ALERT = (255, 160, 40)
-
-COLORS = {ON: C_ON, OFF: C_OFF, MAYBE: C_MAYBE}
-
-GRID_COLS, TILE_W_GAP, TILE_H, TILE_V_GAP = 8, 10, 78, 12   # 8×3: ряд = 8 годин
-GRID_ROWS = 24 // GRID_COLS
-CHIP_H, CHIP_GAP, CHIP_PADX = 60, 12, 26
-
-DAYS_UK = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя"]
-
-FONT_DIR = Path(__file__).resolve().parent / "fonts"
-FONT_FILES = {"med": "Inter-Medium.otf", "semi": "Inter-SemiBold.otf",
-              "bold": "Inter-Bold.otf", "xbold": "Inter-ExtraBold.otf"}
-FONT_FALLBACKS = [
-    "C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-]
+W = 1080
+BG = "#0B1730"
+PANEL = "#142541"
+TEXT = "#F4F7FB"
+MUTED = "#AFC0D7"
+GREEN = "#178A65"
+RED = "#D94F63"
+YELLOW = "#D69B2D"
+GRAY = "#52647D"
 
 
-@lru_cache(maxsize=None)
-def font(weight: str, size: int) -> ImageFont.FreeTypeFont:
-    for candidate in [FONT_DIR / FONT_FILES[weight], *map(Path, FONT_FALLBACKS)]:
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = []
+    if bold:
+        candidates += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]
+    else:
+        candidates += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return ImageFont.truetype(candidate, size=size)
+    return ImageFont.load_default()
+
+
+def _text_fit(draw: ImageDraw.ImageDraw, text: str, max_width: int, start: int,
+              bold: bool = False, min_size: int = 13) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for size in range(start, min_size - 1, -1):
+        font = _font(size, bold)
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            return font
+    return _font(min_size, bold)
+
+
+def _slot_text(index: int) -> str:
+    mins = index * 30
+    return f"{mins // 60:02d}:{mins % 60:02d}–{(mins + 30) // 60:02d}:{(mins + 30) % 60:02d}"
+
+
+def _status(code: str) -> tuple[str, str]:
+    if code == "0":
+        return GREEN, "Є СВІТЛО"
+    if code == "1":
+        return RED, "НЕМАЄ"
+    if code == "2":
+        return YELLOW, "МОЖЛИВО"
+    return GRAY, "НЕВІДОМО"
+
+
+def render_schedule_png(days: dict[str, dict[str, str]], address_label: str,
+                        group: str, checked_at: datetime) -> bytes:
+    """Create a 1080px-wide poster for up to two days of 30-minute periods."""
+    sorted_days = sorted(days.items())[:2]
+    if not sorted_days:
+        raise ValueError("Немає днів для побудови зображення")
+
+    # Header 210px + 2 day panels (585px each) + footer.
+    height = 250 + len(sorted_days) * 600 + 125
+    image = Image.new("RGB", (W, height), BG)
+    draw = ImageDraw.Draw(image)
+
+    draw.rounded_rectangle((34, 28, W - 34, 220), radius=34, fill=PANEL)
+    draw.text((66, 55), "ГРАФІК ВІДКЛЮЧЕНЬ", font=_font(30, True), fill=MUTED)
+    address = address_label
+    address_font = _text_fit(draw, address, W - 132, 43, True, 23)
+    draw.text((66, 104), address, font=address_font, fill=TEXT)
+    draw.rounded_rectangle((66, 165, 285, 207), radius=18, fill="#243D61")
+    draw.text((84, 172), f"ЧЕРГА {group}", font=_font(23, True), fill=TEXT)
+    draw.text((W - 360, 176), "ІНТЕРВАЛИ 30 ХВ", font=_font(17, True), fill=MUTED)
+
+    y = 242
+    for day_iso, schedule in sorted_days:
+        slots = str(schedule.get("slots", ""))
+        if len(slots) != 48:
+            slots = (slots + "3" * 48)[:48]
         try:
-            return ImageFont.truetype(str(candidate), int(size * SS))
-        except OSError:
-            continue
-    raise RuntimeError("Не знайдено шрифт із кирилицею. Покладіть Inter-*.otf у папку fonts/")
+            day_label = datetime.strptime(day_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            day_label = day_iso
+        draw.rounded_rectangle((34, y, W - 34, y + 578), radius=30, fill=PANEL)
+        draw.text((66, y + 24), day_label, font=_font(34, True), fill=TEXT)
+        draw.text((W - 330, y + 36), "ПОНЕДІЛОК–НЕДІЛЯ" if False else "ПОГОДИННО", font=_font(16, True), fill=MUTED)
 
+        left = 62
+        top = y + 92
+        gap_x = 10
+        gap_y = 10
+        cols = 8
+        card_w = (W - 124 - gap_x * (cols - 1)) // cols
+        card_h = 68
+        for idx, code in enumerate(slots):
+            row, col = divmod(idx, cols)
+            x1 = left + col * (card_w + gap_x)
+            y1 = top + row * (card_h + gap_y)
+            bg, label = _status(code)
+            draw.rounded_rectangle((x1, y1, x1 + card_w, y1 + card_h), radius=13, fill=bg)
+            t = _slot_text(idx)
+            f_time = _text_fit(draw, t, card_w - 8, 15, True, 11)
+            bbox = draw.textbbox((0, 0), t, font=f_time)
+            draw.text((x1 + (card_w - (bbox[2] - bbox[0])) / 2, y1 + 10), t, font=f_time, fill="#FFFFFF")
+            f_label = _text_fit(draw, label, card_w - 8, 14, True, 10)
+            lb = draw.textbbox((0, 0), label, font=f_label)
+            draw.text((x1 + (card_w - (lb[2] - lb[0])) / 2, y1 + 39), label, font=f_label, fill="#FFFFFF")
 
-def text_w(text: str, weight: str, size: int) -> float:
-    return font(weight, size).getlength(text) / SS
+        y += 600
 
+    footer_y = height - 95
+    draw.text((58, footer_y), f"ОНОВЛЕНО: {checked_at.strftime('%d.%m.%Y  %H:%M')}  (КИЇВ)",
+              font=_font(21, True), fill=TEXT)
+    draw.text((58, footer_y + 38), "Дані отримані з poweron.toe.com.ua", font=_font(17), fill=MUTED)
 
-# ───────────────────────────── дані для малювання ─────────────────────────────
-@dataclass
-class DayView:
-    day: date
-    title: str
-    schedule: DaySchedule | None
-
-
-def build_views(days: dict[date, DaySchedule], today: date) -> list[DayView]:
-    tomorrow = today + timedelta(days=1)
-    return [
-        DayView(today, "Сьогодні", days.get(today)),
-        DayView(tomorrow, "Завтра", days.get(tomorrow)),
-    ]
-
-
-# ───────────────────────────── «олівець» ─────────────────────────────
-class Pen:
-    def __init__(self, w: int, h: int):
-        self.img = Image.new("RGB", (w * SS, h * SS), BG_TOP)
-        self.d = ImageDraw.Draw(self.img)
-        total = h * SS
-        for y in range(total):  # вертикальний градієнт фону (без зайвих повнорозмірних копій у пам'яті)
-            k = y / max(1, total - 1)
-            color = tuple(round(BG_TOP[i] + (BG_BOT[i] - BG_TOP[i]) * k) for i in range(3))
-            self.d.line([(0, y), (w * SS, y)], fill=color)
-
-    @staticmethod
-    def s(v: float) -> int:
-        return int(round(v * SS))
-
-    def box(self, b):
-        return tuple(self.s(v) for v in b)
-
-    def rrect(self, b, r, fill=None, outline=None, width=0):
-        x0, y0, x1, y1 = self.box(b)
-        self.d.rounded_rectangle((x0, y0, x1 - 1, y1 - 1), radius=self.s(r), fill=fill,
-                                 outline=outline, width=self.s(width) if outline else 0)
-
-    def grad_rrect(self, b, r, c0, c1):
-        x0, y0, x1, y1 = self.box(b)
-        w, h = x1 - x0, y1 - y0
-        g = Image.linear_gradient("L").rotate(90, expand=True).resize((w, h))
-        layer = Image.composite(Image.new("RGB", (w, h), c1), Image.new("RGB", (w, h), c0), g)
-        mask = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=self.s(r), fill=255)
-        self.img.paste(layer, (x0, y0), mask)
-
-    def tile(self, b, r, c_left, c_right):
-        """Плитка-година: ліва половина = :00–:30, права = :30–:00."""
-        x0, y0, x1, y1 = self.box(b)
-        w, h = x1 - x0, y1 - y0
-        layer = Image.new("RGB", (w, h), c_left)
-        if c_right != c_left:
-            ImageDraw.Draw(layer).rectangle((w // 2, 0, w, h), fill=c_right)
-        mask = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=self.s(r), fill=255)
-        self.img.paste(layer, (x0, y0), mask)
-
-    def text(self, xy, t, f, fill, anchor="lm"):
-        self.d.text((self.s(xy[0]), self.s(xy[1])), t, font=f, fill=fill, anchor=anchor)
-
-    def circle(self, cx, cy, r, fill):
-        self.d.ellipse((self.s(cx - r), self.s(cy - r), self.s(cx + r), self.s(cy + r)), fill=fill)
-
-    def polygon(self, pts, fill):
-        self.d.polygon([(self.s(x), self.s(y)) for x, y in pts], fill=fill)
-
-    def line(self, pts, fill, width):
-        sp = [(self.s(x), self.s(y)) for x, y in pts]
-        self.d.line(sp, fill=fill, width=self.s(width), joint="curve")
-        r = self.s(width) / 2
-        for x, y in (sp[0], sp[-1]):
-            self.d.ellipse((x - r, y - r, x + r, y + r), fill=fill)
-
-
-# ───────────────────────────── розкладка ─────────────────────────────
-def _chips_for(sched: DaySchedule) -> list[tuple[str, tuple]]:
-    items = []
-    for code, a, b in intervals_of(sched.slots):
-        label = f"{fmt_range(a, b)} · {fmt_duration((b - a) * 30)}"
-        items.append((label, COLORS[code]))
-    if not items:
-        items.append(("Відключень не заплановано", C_ON))
-    return items
-
-
-def _chip_rows(items, max_w):
-    rows, cur, x = [], [], 0.0
-    for text, color in items:
-        w = text_w(text, "bold", 28) + 2 * CHIP_PADX
-        if cur and x + w > max_w:
-            rows.append(cur)
-            cur, x = [], 0.0
-        cur.append((x, w, text, color))
-        x += w + CHIP_GAP
-    if cur:
-        rows.append(cur)
-    return rows
-
-
-GRID_H = GRID_ROWS * TILE_H + (GRID_ROWS - 1) * TILE_V_GAP
-HEAD_BLOCK = 150           # від верху картки до початку сітки
-HEADER_H, FOOTER_H = 190, 236
-INNER_W = W - 2 * PAD - 2 * 36
-
-
-def _day_height(view: DayView) -> int:
-    if view.schedule is None:
-        return 150
-    rows = _chip_rows(_chips_for(view.schedule), INNER_W)
-    chips_h = len(rows) * CHIP_H + (len(rows) - 1) * CHIP_GAP
-    return HEAD_BLOCK + GRID_H + 28 + chips_h + 36
-
-
-# ───────────────────────────── блоки ─────────────────────────────
-def _draw_header(p: Pen, y: int, address: str, group: str):
-    p.grad_rrect((PAD, y, W - PAD, y + HEADER_H), 38, HEAD_A, HEAD_B)
-    cx, cy = PAD + 36 + 46, y + HEADER_H // 2
-    p.circle(cx, cy, 46, (255, 255, 255))
-    p.polygon([(cx + 6, cy - 30), (cx - 22, cy + 4), (cx - 3, cy + 4),
-               (cx - 9, cy + 30), (cx + 22, cy - 6), (cx + 3, cy - 6)], (255, 170, 0))
-
-    badge = f"Черга {group}"
-    bw = text_w(badge, "xbold", 34) + 56
-    bx1 = W - PAD - 36
-    p.rrect((bx1 - bw, cy - 38, bx1, cy + 38), 38, fill=(255, 255, 255))
-    p.text((bx1 - bw / 2, cy), badge, font("xbold", 34), HEAD_A, "mm")
-
-    tx = cx + 46 + 28
-    p.text((tx, cy - 24), "Графік відключень", font("xbold", 46), TEXT)
-    size, avail = 28, bx1 - bw - 24 - tx
-    while text_w(address, "med", size) > avail and size > 18:
-        size -= 1
-    p.text((tx, cy + 28), address, font("med", size), (226, 232, 255))
-
-
-def _draw_day(p: Pen, y: int, view: DayView, now: datetime) -> int:
-    h = _day_height(view)
-    x0, x1 = PAD, W - PAD
-    p.rrect((x0, y, x1, y + h), 38, fill=CARD, outline=CARD_BORDER, width=2)
-    ix = x0 + 36
-
-    date_line = f"{view.day.strftime('%d.%m.%Y')} · {DAYS_UK[view.day.weekday()]}"
-    p.text((ix, y + 58), view.title, font("xbold", 50), TEXT)
-    p.text((ix, y + 104), date_line, font("med", 28), MUTED)
-
-    sched = view.schedule
-    if sched is None:
-        pill, color = "Графік ще не опублікований", C_UNKNOWN
-    else:
-        off_min = count_minutes(sched.slots, OFF)
-        if off_min:
-            pill, color = f"Без світла: {fmt_duration(off_min)}", C_OFF
-        elif count_minutes(sched.slots, MAYBE):
-            pill, color = "Можливі відключення", C_MAYBE
-        else:
-            pill, color = "Відключень немає", C_ON
-    pw = text_w(pill, "bold", 29) + 52
-    p.rrect((x1 - 36 - pw, y + 40, x1 - 36, y + 100), 30, fill=color)
-    p.text((x1 - 36 - pw / 2, y + 70), pill, font("bold", 29), INK, "mm")
-    if sched is None:
-        return h
-
-    # сітка 8×3: ряд = 8 годин доби
-    tile_w = (INNER_W - (GRID_COLS - 1) * TILE_W_GAP) / GRID_COLS
-    gy = y + HEAD_BLOCK
-    now_hour = now.hour if view.day == now.date() else None
-    marker = None
-    for hour in range(24):
-        r, c = divmod(hour, GRID_COLS)
-        tx0 = ix + c * (tile_w + TILE_W_GAP)
-        ty0 = gy + r * (TILE_H + TILE_V_GAP)
-        a, b = sched.slots[hour * 2], sched.slots[hour * 2 + 1]
-        p.tile((tx0, ty0, tx0 + tile_w, ty0 + TILE_H), 22,
-               COLORS.get(a, C_UNKNOWN), COLORS.get(b, C_UNKNOWN))
-        p.text((tx0 + tile_w / 2, ty0 + TILE_H / 2), f"{hour:02d}–{hour + 1:02d}",
-               font("xbold", 30), INK, "mm")
-        if hour == now_hour:
-            marker = (tx0, ty0, tile_w)
-    if marker:  # біле кільце + позначка «ЗАРАЗ» навколо поточної години
-        tx0, ty0, tw = marker
-        p.rrect((tx0 - 5, ty0 - 5, tx0 + tw + 5, ty0 + TILE_H + 5), 26, outline=(255, 255, 255), width=5)
-        p.rrect((tx0 + tw / 2 - 40, ty0 - 17, tx0 + tw / 2 + 40, ty0 + 13), 15, fill=(255, 255, 255))
-        p.text((tx0 + tw / 2, ty0 - 2), "ЗАРАЗ", font("xbold", 17), INK, "mm")
-
-    # чіпи з проміжками
-    cy = gy + GRID_H + 28
-    for row in _chip_rows(_chips_for(sched), INNER_W):
-        for off, w, text, color in row:
-            p.rrect((ix + off, cy, ix + off + w, cy + CHIP_H), CHIP_H / 2, fill=color)
-            p.text((ix + off + w / 2, cy + CHIP_H / 2), text, font("bold", 28), INK, "mm")
-        cy += CHIP_H + CHIP_GAP
-    return h
-
-
-def _draw_footer(p: Pen, y: int, status: str, updated: datetime, interval_min: int):
-    x0, x1 = PAD, W - PAD
-    ok = status == "nochange"
-    accent = C_ON if ok else C_ALERT
-    p.rrect((x0, y, x1, y + FOOTER_H), 38, fill=CARD, outline=accent, width=3)
-
-    cx, cy = x0 + 36 + 34, y + 62
-    p.circle(cx, cy, 34, accent)
-    if ok:
-        p.line([(cx - 14, cy + 1), (cx - 4, cy + 11), (cx + 15, cy - 11)], INK, 8)
-    else:
-        p.rrect((cx - 4, cy - 18, cx + 4, cy + 4), 4, fill=INK)
-        p.circle(cx, cy + 15, 5, INK)
-
-    title = "Змін немає" if ok else "Графік оновлено"
-    p.text((cx + 34 + 24, cy - 14), title, font("xbold", 40), TEXT)
-    p.text((cx + 34 + 24, cy + 24), f"Оновлено о {updated.strftime('%H:%M')}  ·  перевірка кожні {interval_min} хв",
-           font("med", 26), MUTED)
-
-    # легенда
-    lx, ly = x0 + 36, y + FOOTER_H - 82
-    for color, label in ((C_ON, "Є світло"), (C_OFF, "Немає світла"), (C_MAYBE, "Можливе відключення")):
-        p.rrect((lx, ly - 11, lx + 22, ly + 11), 7, fill=color)
-        p.text((lx + 34, ly), label, font("semi", 25), TEXT)
-        lx += 34 + text_w(label, "semi", 25) + 36
-    p.text((x0 + 36, y + FOOTER_H - 38), "Кожна плитка — година; половинки — по 30 хв", font("med", 23), MUTED)
-
-
-# ───────────────────────────── головна функція ─────────────────────────────
-def render_png(views: list[DayView], address: str, group: str, status: str,
-               now: datetime, interval_min: int = 10) -> bytes:
-    """status: 'nochange' (зелена позначка «Змін немає») або 'changed' / 'first'."""
-    total_h = PAD + HEADER_H + GAP + sum(_day_height(v) + GAP for v in views) + FOOTER_H + PAD
-    p = Pen(W, total_h)
-    y = PAD
-    _draw_header(p, y, address, group)
-    y += HEADER_H + GAP
-    for view in views:
-        y += _draw_day(p, y, view, now) + GAP
-    _draw_footer(p, y, status, now, interval_min)
-
-    img = p.img.resize((W, total_h), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, "PNG", optimize=True)
-    return buf.getvalue()
-
-
-def _demo_slots(off: list[tuple[int, int]], maybe: list[tuple[int, int]] = ()) -> str:
-    s = [ON] * 48
-    for a, b in maybe:
-        s[a:b] = [MAYBE] * (b - a)
-    for a, b in off:
-        s[a:b] = [OFF] * (b - a)
-    return "".join(s)
-
-
-if __name__ == "__main__":
-    from zoneinfo import ZoneInfo
-
-    tz = ZoneInfo("Europe/Kyiv")
-    now = datetime.now(tz)
-    today = now.date()
-    demo = {
-        today: DaySchedule(today, _demo_slots([(16, 24), (36, 44)], [(24, 28), (10, 13)])),
-        today + timedelta(days=1): DaySchedule(today + timedelta(days=1),
-                                                _demo_slots([(4, 10), (21, 27), (38, 46)])),
-    }
-    for status in ("nochange", "changed"):
-        png = render_png(build_views(demo, today), "Приклад адреси", "5.1", status, now)
-        Path(f"demo_{status}.png").write_bytes(png)
-        print(f"demo_{status}.png", len(png) // 1024, "КБ")
+    stream = BytesIO()
+    image.save(stream, format="PNG", optimize=True)
+    return stream.getvalue()

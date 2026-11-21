@@ -1,57 +1,261 @@
-"""Клієнт API сайту poweron.toe.com.ua (Тернопільобленерго) + порівняння графіків."""
+"""Address lookup and outage schedule client for poweron.toe.com.ua."""
 from __future__ import annotations
 
 import base64
 import json
 import logging
-from dataclasses import dataclass
+import re
+import time
 from datetime import date, datetime, timedelta
+from typing import Any
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
 
 log = logging.getLogger("toe")
-
 API_BASE = "https://api-poweron.toe.com.ua/api"
-
-# Статуси півгодинних слотів у відповіді сайту: "0" світло є, "1" немає, "10" можливе відключення.
-# У коді працюємо з односимвольними кодами, щоб графік дня був рядком із 48 символів.
-ON, OFF, MAYBE, UNKNOWN = "0", "1", "2", "3"
-_RAW_TO_CODE = {"0": ON, "1": OFF, "10": MAYBE}
+ORIGIN = "https://poweron.toe.com.ua"
+ADDRESS_ENDPOINT = f"{API_BASE}/pw_address_queues"
+SCHEDULE_ENDPOINT = f"{API_BASE}/a_gpv_g"
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
     "Accept": "application/json",
-    "Origin": "https://poweron.toe.com.ua",
-    "Referer": "https://poweron.toe.com.ua/",
+    "Origin": ORIGIN,
+    "Referer": f"{ORIGIN}/",
 }
+RAW_STATUS = {"0": "0", "1": "1", "10": "2"}  # light / outage / possible outage
 
 
-@dataclass(frozen=True)
-class DaySchedule:
-    day: date
-    slots: str  # 48 символів: ON / OFF / MAYBE / UNKNOWN, слот = 30 хв, починаючи з 00:00
-    created: str = ""  # dateCreate з API (для логів)
+class ToeAPIError(RuntimeError):
+    pass
 
 
-# ───────────────────────────── завантаження ─────────────────────────────
+def normalize(value: str) -> str:
+    value = value.lower().replace("ё", "е").replace("’", "'").replace("`", "'")
+    value = re.sub(r"[^0-9a-zа-яіїєґ'\-]+", " ", value, flags=re.IGNORECASE)
+    tokens = value.split()
+    aliases = {
+        "вулиця": "вул", "вулиці": "вул", "вул.": "вул",
+        "провулок": "пров", "провулка": "пров", "пров.": "пров",
+        "проспект": "просп", "просп.": "просп",
+        "площа": "пл", "пл.": "пл",
+    }
+    return " ".join(aliases.get(token, token) for token in tokens)
 
-def fetch_schedule(
-    address_key: str,
-    group: str,
-    tz: ZoneInfo,
-    session: requests.Session | None = None,
-    timeout: int = 20,
-) -> dict[date, DaySchedule]:
-    """Повертає графіки на сьогодні та завтра (тільки ті дати, які є на сайті)."""
-    sess = session or requests.Session()
+
+def _json_members(payload: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)], {}
+    if isinstance(payload, dict):
+        members = payload.get("hydra:member") or payload.get("member") or payload.get("data") or []
+        view = payload.get("hydra:view") or payload.get("view") or {}
+        if isinstance(members, list):
+            return [item for item in members if isinstance(item, dict)], view if isinstance(view, dict) else {}
+    raise ToeAPIError("API повернув невідомий формат списку адрес")
+
+
+def _contains_all(field: str, words: list[str]) -> bool:
+    haystack = normalize(field)
+    return bool(haystack) and all(word in haystack for word in words)
+
+
+def _building_matches(building_names: str, requested: str) -> bool:
+    wanted = normalize(requested)
+    options = [normalize(part) for part in str(building_names or "").split(",")]
+    return wanted in options
+
+
+def load_or_build_address_index(cache_path: str | None = None, *, session: requests.Session | None = None,
+                                max_pages: int = 600) -> list[dict[str, Any]]:
+    """Load the public TOE address directory from Actions cache or download it once.
+
+    The directory is public data from TOE. It is cached outside the repository so
+    a new user's street lookup does not need to scan hundreds of API pages again.
+    """
+    from pathlib import Path
+
+    path = Path(cache_path) if cache_path else Path(".cache/toe_address_index.json")
+    if path.exists():
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            rows = cached.get("records") if isinstance(cached, dict) else None
+            if isinstance(rows, list) and rows:
+                log.info("Завантажено адресний довідник з кешу: %d записів", len(rows))
+                return [row for row in rows if isinstance(row, dict)]
+        except (OSError, ValueError):
+            log.warning("Кеш адресного довідника пошкоджено; завантажую його заново")
+
+    http = session or requests.Session()
+    http.headers.update(HEADERS)
+    all_rows: list[dict[str, Any]] = []
+    seen_pages: set[str] = set()
+    url: str | None = ADDRESS_ENDPOINT
+    params: dict[str, Any] | None = {"page": 1, "itemsPerPage": 30}
+    page = 0
+    while url and page < max_pages:
+        page += 1
+        last_error: Exception | None = None
+        payload: Any = None
+        for attempt in range(3):
+            try:
+                response = http.get(url, params=params, timeout=18)
+                response.raise_for_status()
+                payload = response.json()
+                last_error = None
+                break
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+        if last_error is not None:
+            raise ToeAPIError(f"Не вдалося завантажити довідник адрес (сторінка {page}): {last_error}")
+
+        members, view = _json_members(payload)
+        if not members:
+            break
+        fingerprint = json.dumps(members, ensure_ascii=False, sort_keys=True)
+        if fingerprint in seen_pages:
+            raise ToeAPIError(f"API повторив сторінку {page}; повний адресний довідник не завантажено")
+        seen_pages.add(fingerprint)
+        all_rows.extend(members)
+
+        next_link = view.get("hydra:next") or view.get("next")
+        if next_link:
+            url = urljoin(ORIGIN, str(next_link))
+            params = None
+        elif len(members) >= 30:
+            url = ADDRESS_ENDPOINT
+            params = {"page": page + 1, "itemsPerPage": 30}
+        else:
+            url, params = None, None
+        if page % 25 == 0:
+            log.info("Завантаження адресного довідника: %d сторінок, %d записів", page, len(all_rows))
+
+    if page >= max_pages and url:
+        raise ToeAPIError(f"Довідник перевищив ліміт {max_pages} сторінок; кеш не збережено")
+    if not all_rows:
+        raise ToeAPIError("Сайт повернув порожній адресний довідник")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps({"records": all_rows}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    log.info("Адресний довідник завантажено: %d сторінок, %d записів", page, len(all_rows))
+    return all_rows
+
+
+def find_street_records(city: str, street: str, *, session: requests.Session | None = None,
+                        max_pages: int = 600, cached_records: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Return API address-queue rows filtered by city and street."""
+    city_words = normalize(city).split()
+    street_words = normalize(street).split()
+    if not city_words or not street_words:
+        raise ValueError("Вкажіть і населений пункт, і вулицю")
+
+    if cached_records is not None:
+        source_records = cached_records
+    else:
+        http = session or requests.Session()
+        http.headers.update(HEADERS)
+        source_records = []
+        seen_pages: set[str] = set()
+        url: str | None = ADDRESS_ENDPOINT
+        params: dict[str, Any] | None = {"page": 1, "itemsPerPage": 30}
+        page = 0
+        while url and page < max_pages:
+            page += 1
+            last_error: Exception | None = None
+            response_payload: Any = None
+            for attempt in range(3):
+                try:
+                    response = http.get(url, params=params, timeout=18)
+                    response.raise_for_status()
+                    response_payload = response.json()
+                    last_error = None
+                    break
+                except (requests.RequestException, ValueError) as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        time.sleep(0.6 * (attempt + 1))
+            if last_error is not None:
+                raise ToeAPIError(f"Не вдалося прочитати довідник адрес (сторінка {page}): {last_error}")
+
+            members, view = _json_members(response_payload)
+            if not members:
+                break
+            fingerprint = json.dumps(members, ensure_ascii=False, sort_keys=True)
+            if fingerprint in seen_pages:
+                log.warning("API повторив сторінку %s; зупиняю пагінацію", page)
+                break
+            seen_pages.add(fingerprint)
+            source_records.extend(members)
+
+            next_link = view.get("hydra:next") or view.get("next")
+            if next_link:
+                url = urljoin(ORIGIN, str(next_link))
+                params = None
+            elif isinstance(response_payload, list) and len(members) >= 30:
+                url = ADDRESS_ENDPOINT
+                params = {"page": page + 1, "itemsPerPage": 30}
+            elif isinstance(response_payload, dict) and len(members) >= 30:
+                url = ADDRESS_ENDPOINT
+                params = {"page": page + 1, "itemsPerPage": 30}
+            else:
+                url, params = None, None
+            if page % 25 == 0:
+                log.info("Пошук адрес: сторінка %d, отримано записів %d", page, len(source_records))
+
+        if page >= max_pages and url:
+            raise ToeAPIError(
+                f"Пошук зупинено після {max_pages} сторінок. Збільште MAX_ADDRESS_PAGES або повторіть пізніше."
+            )
+
+    matches: list[dict[str, Any]] = []
+    for row in source_records:
+        city_name = str((row.get("city") or {}).get("name", ""))
+        street_name = str((row.get("street") or {}).get("name", ""))
+        if _contains_all(city_name, city_words) and _contains_all(street_name, street_words):
+            matches.append(row)
+    return matches
+
+
+def find_address_matches(city: str, street: str, building: str, *, session: requests.Session | None = None,
+                         max_pages: int = 600, cached_records: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
+    records = find_street_records(city, street, session=session, max_pages=max_pages, cached_records=cached_records)
+    matches: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in records:
+        city_obj = row.get("city") or {}
+        street_obj = row.get("street") or {}
+        city_id = str(city_obj.get("id", "")).strip()
+        street_id = str(street_obj.get("id", "")).strip()
+        if not city_id or not street_id or not _building_matches(str(row.get("buildingNames", "")), building):
+            continue
+        group = str(row.get("chergGpv", "")).strip()
+        label = f"{city_obj.get('name', city)} · {street_obj.get('name', street)} · {building}"
+        identity = (city_id, street_id, group)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        matches.append({
+            "address_key": f"{city_id}/{street_id}/{building.strip()}",
+            "city": str(city_obj.get("name", city)),
+            "street": str(street_obj.get("name", street)),
+            "building": building.strip(),
+            "group": group,
+            "label": label,
+        })
+    return matches
+
+
+def fetch_schedule(address_key: str, group: str, tz: ZoneInfo,
+                   session: requests.Session | None = None, timeout: int = 25) -> dict[str, dict[str, str]]:
+    """Return {YYYY-MM-DD: {slots: 48-char string, created: ...}} for today/tomorrow."""
+    http = session or requests.Session()
     now = datetime.now(tz)
     today = now.date()
-
-    # Так само, як це робить фронтенд сайту. Ключ адреси передається у base64 в X-debug-key.
     after = (now - timedelta(days=1)).strftime("%Y-%m-%dT12:00:00+00:00")
     before = (now + timedelta(days=1)).strftime("%Y-%m-%dT23:59:59+00:00")
     headers = dict(HEADERS)
@@ -62,150 +266,50 @@ def fetch_schedule(
         "group[]": group,
         "time": address_key.replace("/", ""),
     }
-
-    resp = sess.get(f"{API_BASE}/a_gpv_g", params=params, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
+    try:
+        response = http.get(SCHEDULE_ENDPOINT, params=params, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise ToeAPIError(f"Не вдалося отримати графік: {exc}") from exc
 
     if isinstance(payload, list):
         members = payload
-    else:
+    elif isinstance(payload, dict):
         members = payload.get("hydra:member") or payload.get("member") or []
+    else:
+        raise ToeAPIError("API графіків повернув невідомий формат")
 
-    found: dict[date, DaySchedule] = {}
+    found: dict[str, dict[str, str]] = {}
     for member in members:
-        parsed = _parse_member(member, group)
-        if parsed is None:
+        data = member.get("dataJson") if isinstance(member, dict) else None
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except ValueError:
+                continue
+        if not isinstance(data, dict):
             continue
-        if not (today <= parsed.day <= today + timedelta(days=1)):
+        group_data = data.get(group)
+        if not isinstance(group_data, dict):
+            group_data = next((v for k, v in data.items() if str(k).strip() == group.strip()), None)
+        if not isinstance(group_data, dict):
             continue
-        prev = found.get(parsed.day)
-        # якщо на одну дату є кілька версій — беремо найсвіжішу за dateCreate
-        if prev is None or parsed.created >= prev.created:
-            found[parsed.day] = parsed
-    return found
-
-
-def _parse_member(member: dict, group: str) -> DaySchedule | None:
-    data = member.get("dataJson")
-    if isinstance(data, str):
+        day_raw = str(member.get("dateGraph", ""))[:10]
         try:
-            data = json.loads(data)
+            day = date.fromisoformat(day_raw)
         except ValueError:
-            return None
-    if not isinstance(data, dict):
-        return None
-
-    group_data = data.get(group)
-    if group_data is None:
-        for key, value in data.items():
-            if str(key).strip() == group.strip():
-                group_data = value
-                break
-    if not isinstance(group_data, dict):
-        return None
-    times = group_data.get("times") or {}
-
-    raw_date = str(member.get("dateGraph", ""))[:10]
-    try:
-        day = date.fromisoformat(raw_date)
-    except ValueError:
-        return None
-
-    slots = []
-    for hour in range(24):
-        for minute in (0, 30):
-            raw = str(times.get(f"{hour:02d}:{minute:02d}", "0")).strip()
-            code = _RAW_TO_CODE.get(raw)
-            if code is None:
-                log.warning("Невідомий статус слота %s %02d:%02d: %r", day, hour, minute, raw)
-                code = UNKNOWN
-            slots.append(code)
-    return DaySchedule(day=day, slots="".join(slots), created=str(member.get("dateCreate", "")))
-
-
-# ───────────────────────────── допоміжне ─────────────────────────────
-
-def fmt_slot(index: int) -> str:
-    minutes = index * 30
-    return "24:00" if minutes >= 1440 else f"{minutes // 60:02d}:{minutes % 60:02d}"
-
-
-def fmt_range(start: int, end: int) -> str:
-    return f"{fmt_slot(start)}–{fmt_slot(end)}"
-
-
-def fmt_duration(minutes: int) -> str:
-    h, m = divmod(minutes, 60)
-    if h and m:
-        return f"{h} год {m} хв"
-    return f"{h} год" if h else f"{m} хв"
-
-
-def intervals_of(slots: str) -> list[tuple[str, int, int]]:
-    """Суцільні проміжки відключень: (статус, перший_слот, слот_після_останнього)."""
-    out: list[tuple[str, int, int]] = []
-    i = 0
-    while i < len(slots):
-        j = i
-        while j < len(slots) and slots[j] == slots[i]:
-            j += 1
-        if slots[i] in (OFF, MAYBE):
-            out.append((slots[i], i, j))
-        i = j
-    return out
-
-
-def count_minutes(slots: str, code: str) -> int:
-    return slots.count(code) * 30
-
-
-# ───────────────────────────── порівняння ─────────────────────────────
-
-def snapshot_of(days: dict[date, DaySchedule]) -> dict[str, str]:
-    return {d.isoformat(): s.slots for d, s in sorted(days.items())}
-
-
-def _ranges(indexes: list[int]) -> str:
-    parts, start, prev = [], None, None
-    for idx in indexes:
-        if start is None:
-            start = prev = idx
-        elif idx == prev + 1:
-            prev = idx
-        else:
-            parts.append(fmt_range(start, prev + 1))
-            start = prev = idx
-    if start is not None:
-        parts.append(fmt_range(start, prev + 1))
-    return ", ".join(parts)
-
-
-def diff_snapshots(old: dict[str, str], new: dict[str, str], today: date) -> list[str]:
-    """Список людських описів змін. Порожній список = змін немає.
-
-    Дати, які вже минули, ігноруються (опівночі вчорашній день зникає з відповіді — це не зміна).
-    """
-    lines: list[str] = []
-    for iso, slots in new.items():
-        label = date.fromisoformat(iso).strftime("%d.%m")
-        if iso not in old:
-            lines.append(f"📅 Опубліковано графік на {label}")
             continue
-        before = old[iso]
-        if before == slots:
+        if not (today <= day <= today + timedelta(days=1)):
             continue
-        lines_before = len(lines)
-        for code, icon, word in ((OFF, "🔴", "відключення"), (MAYBE, "🟡", "можливе відключення")):
-            added = [i for i in range(len(slots)) if slots[i] == code and before[i] != code]
-            removed = [i for i in range(len(slots)) if before[i] == code and slots[i] != code]
-            if added:
-                lines.append(f"{icon} {label}: додано {word} {_ranges(added)}")
-            if removed:
-                lines.append(f"🟢 {label}: прибрано {word} {_ranges(removed)}")
-        if len(lines) == lines_before:  # змінилися лише «невідомі» слоти тощо
-            lines.append(f"✏️ {label}: графік змінено")
-    for iso in old:
-        if iso not in new and date.fromisoformat(iso) >= today:
-            lines.append(f"⚠️ Графік на {date.fromisoformat(iso).strftime('%d.%m')} зник із сайту")
-    return lines
+        times = group_data.get("times") or {}
+        slots: list[str] = []
+        for hour in range(24):
+            for minute in (0, 30):
+                raw = str(times.get(f"{hour:02d}:{minute:02d}", "0")).strip()
+                slots.append(RAW_STATUS.get(raw, "3"))
+        created = str(member.get("dateCreate", ""))
+        key = day.isoformat()
+        if key not in found or created >= found[key]["created"]:
+            found[key] = {"slots": "".join(slots), "created": created}
+    return found

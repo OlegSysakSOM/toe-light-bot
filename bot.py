@@ -1,256 +1,446 @@
-"""Telegram-бот графіків відключень світла (Тернопільобленерго, poweron.toe.com.ua).
+"""Public multi-user Telegram bot for Ternopiloblenergo outage schedules.
 
-Раз на 15 хв (CHECK_INTERVAL_SECONDS; можна змінити) бере графік з API сайту:
-  • є зміни      → надсилає НОВЕ повідомлення з картинкою й переліком змін;
-  • змін немає   → РЕДАГУЄ попереднє повідомлення (картинка + час оновлення + «Змін немає»).
-
-Запуск:
-  python bot.py              — працювати постійно
-  python bot.py --once       — одна перевірка й вихід
-  python bot.py --preview    — завантажити графік, вивести в консоль і зберегти preview.png (без Telegram)
+Runs once per GitHub Actions invocation. Incoming updates are handled via
+getUpdates; subscriptions and message IDs are stored in encrypted state.enc.
 """
 from __future__ import annotations
 
 import argparse
-import json
+import html
 import logging
-import os
 import sys
-import time
-from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
-from cryptography.fernet import Fernet, InvalidToken
 
-from config import BASE_DIR, Config, load_config
-from render import build_views, render_png
+from config import load_config
+from render import render_schedule_png
+from state_store import StateStore
 from telegram_api import Telegram, TelegramError
-from toe_api import OFF, count_minutes, diff_snapshots, fetch_schedule, fmt_duration, fmt_range, \
-    intervals_of, snapshot_of
+from toe_api import ToeAPIError, find_address_matches, fetch_schedule, load_or_build_address_index, normalize
 
-log = logging.getLogger("bot")
+log = logging.getLogger("public_toe_bot")
 
-
-# ───────────────────────────── стан між перезапусками ─────────────────────────────
-@dataclass
-class State:
-    chat_id: str = ""
-    message_id: int | None = None
-    snapshot: dict | None = None          # None = ще жодного разу не зберігали
-    fail_count: int = 0
-    error_notified: bool = False
-    last_ok: str = ""
-    path: Path = field(default=Path("state.json"), repr=False)
-
-    @classmethod
-    def load(cls, path: Path) -> "State":
-        st = cls(path=path)
-        if path.exists():
-            try:
-                payload = path.read_bytes()
-                key = os.environ.get("STATE_ENCRYPTION_KEY", "").strip()
-                if key:
-                    payload = Fernet(key.encode("ascii")).decrypt(payload)
-                raw = json.loads(payload.decode("utf-8"))
-                for name in ("chat_id", "message_id", "snapshot", "fail_count", "error_notified", "last_ok"):
-                    if name in raw:
-                        setattr(st, name, raw[name])
-            except (ValueError, OSError, InvalidToken) as exc:
-                raise SystemExit(
-                    f"Не вдалося прочитати стан {path}. Перевірте STATE_ENCRYPTION_KEY: {exc}"
-                ) from exc
-        return st
-
-    def save(self) -> None:
-        data = {k: v for k, v in asdict(self).items() if k != "path"}
-        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        key = os.environ.get("STATE_ENCRYPTION_KEY", "").strip()
-        if key:
-            payload = Fernet(key.encode("ascii")).encrypt(payload)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_bytes(payload)
-        os.replace(tmp, self.path)
+WELCOME = (
+    "👋 <b>Вітаю! Це публічний бот графіків відключень Тернопільобленерго.</b>\n\n"
+    "Щоб підключити персональний графік, надішліть назву населеного пункту. "
+    "Потім я запитаю вулицю та номер будинку, знайду вашу чергу й надсилатиму оновлення.\n\n"
+    "Команди: /address — змінити адресу, /status — моя підписка, "
+    "/stop — вимкнути сповіщення, /help — допомога."
+)
 
 
-# ───────────────────────────── підписи до повідомлень ─────────────────────────────
-def caption_first(group: str, now: datetime) -> str:
-    return f"📊 <b>Графік відключень</b> · черга {group}\n🕒 Оновлено о {now:%H:%M}"
+def _new_user() -> dict[str, Any]:
+    return {
+        "active": False,
+        "flow": None,
+        "city_input": "",
+        "street_input": "",
+        "pending_matches": [],
+        "address_key": "",
+        "address_label": "",
+        "group": "",
+        "snapshot": {},
+        "message_id": None,
+        "fail_count": 0,
+        "error_notified": False,
+        "no_schedule_notified": False,
+        "last_ok": "",
+    }
 
 
-def caption_changed(group: str, now: datetime, lines: list[str]) -> str:
-    shown = lines[:12] + (["…"] if len(lines) > 12 else [])
-    body = "\n".join(shown)
-    return f"🔔 <b>Графік оновлено!</b> · черга {group}\n{body}\n🕒 Оновлено о {now:%H:%M}"
+def _safe_text(value: str) -> str:
+    return html.escape(str(value), quote=False)
 
 
-def caption_nochange(now: datetime) -> str:
-    return f"✅ <b>Змін немає</b>\n🕒 Оновлено о {now:%H:%M}"
+def _command(text: str) -> str | None:
+    if not text.startswith("/"):
+        return None
+    return text.split()[0].split("@", 1)[0].lower()
 
 
-# ───────────────────────────── один цикл перевірки ─────────────────────────────
-def run_cycle(cfg: Config, tg: Telegram, tz: ZoneInfo, state: State, http: requests.Session) -> None:
-    now = datetime.now(tz)
-    interval_min = max(1, cfg.interval_seconds // 60)
+def _send(tg: Telegram, chat_id: str, text: str) -> None:
+    tg.send_message(chat_id, text)
 
-    try:
-        days = fetch_schedule(cfg.address_key, cfg.group, tz, http)
-        snapshot = snapshot_of(days)
-        if not snapshot:
-            raise RuntimeError("сайт не повернув графік на сьогодні або завтра; не публікую порожнє зображення")
-    except Exception as exc:  # мережа, 5xx, зміна формату тощо
-        _on_fetch_failure(cfg, tg, state, now, exc)
+
+def _find_matches_for_user(user: dict[str, Any], building: str,
+                           cfg: Any, http: requests.Session) -> list[dict[str, str]]:
+    # Full public address directory is restored via actions/cache. It is scanned
+    # from TOE only once per cache version; subsequent users are resolved locally.
+    address_rows = load_or_build_address_index(
+        str(cfg.address_index_file),
+        session=http,
+        max_pages=cfg.max_address_pages,
+    )
+    return find_address_matches(
+        user["city_input"], user["street_input"], building,
+        session=http,
+        max_pages=cfg.max_address_pages,
+        cached_records=address_rows,
+    )
+
+
+def _activate_subscription(chat_id: str, user: dict[str, Any], candidate: dict[str, str], tg: Telegram) -> None:
+    if not candidate.get("group") or normalize(candidate["group"]) in {"не входить", "не входить в графік"}:
+        _send(tg, chat_id,
+              "⚠️ Для цієї адреси сайт не вказав чергу погодинних відключень (ГПВ). "
+              "Перевірте адресу на poweron.toe.com.ua або спробуйте іншу.")
+        user["flow"] = None
         return
 
-    state.fail_count, state.error_notified, state.last_ok = 0, False, f"{now:%d.%m %H:%M}"
+    user.update({
+        "active": True,
+        "flow": None,
+        "pending_matches": [],
+        "address_key": candidate["address_key"],
+        "address_label": candidate["label"],
+        "group": candidate["group"],
+        "snapshot": {},
+        "message_id": None,
+        "fail_count": 0,
+        "error_notified": False,
+        "no_schedule_notified": False,
+        "last_ok": "",
+    })
+    _send(
+        tg, chat_id,
+        "✅ <b>Підписку активовано!</b>\n\n"
+        f"📍 {_safe_text(candidate['label'])}\n"
+        f"🔢 Черга: <b>{_safe_text(candidate['group'])}</b>\n\n"
+        "Під час найближчої перевірки надішлю актуальне зображення графіка. "
+        "Надалі повідомлення оновлюватиметься автоматично.",
+    )
 
-    views = build_views(days, now.date())
-    first = state.message_id is None
-    changes = [] if state.snapshot is None else diff_snapshots(state.snapshot, snapshot, now.date())
 
-    if first or changes:
-        status = "first" if first else "changed"
-        caption = caption_first(cfg.group, now) if first else caption_changed(cfg.group, now, changes)
-        png = render_png(views, cfg.address_label, cfg.group, status, now, interval_min)
-        _send_new(cfg, tg, state, png, caption)
-        log.info("Надіслано нове повідомлення (%s): %s", status, "; ".join(changes) or "перший запуск")
-    else:
-        png = render_png(views, cfg.address_label, cfg.group, "nochange", now, interval_min)
-        try:
-            tg.edit_photo(state.chat_id, state.message_id, png, caption_nochange(now))
-            log.info("Змін немає — повідомлення %s відредаговано", state.message_id)
-        except TelegramError as exc:
-            if exc.not_modified:
-                log.info("Змін немає — Telegram каже, що повідомлення вже актуальне")
-            elif exc.message_gone:
-                log.warning("Повідомлення видалено в чаті — надсилаю нове")
-                _send_new(cfg, tg, state, png, caption_nochange(now), delete_old=False)
+def _handle_text(chat_id: str, text: str, state: dict[str, Any], tg: Telegram,
+                 cfg: Any, http: requests.Session) -> None:
+    users = state.setdefault("users", {})
+    user = users.setdefault(chat_id, _new_user())
+    command = _command(text)
+
+    if command == "/help":
+        _send(tg, chat_id,
+              "<b>Допомога</b>\n"
+              "/start — підключити або відновити підписку\n"
+              "/address — змінити адресу\n"
+              "/status — переглянути адресу й чергу\n"
+              "/stop — зупинити сповіщення\n"
+              "/cancel — скасувати введення адреси\n\n"
+              "Бот працює в особистому чаті. Зараз підтримуються адреси з довідника "
+              "Тернопільобленерго на poweron.toe.com.ua.")
+        return
+
+    if command == "/cancel":
+        user["flow"] = None
+        user["pending_matches"] = []
+        _send(tg, chat_id, "Введення адреси скасовано. Поточна підписка (якщо є) залишилася без змін.")
+        return
+
+    if command == "/stop":
+        if user.get("active"):
+            user["active"] = False
+            user["flow"] = None
+            _send(tg, chat_id, "🔕 Сповіщення вимкнено. Щоб відновити їх, надішліть /start.")
+        else:
+            _send(tg, chat_id, "Активної підписки немає. Для підключення надішліть /start.")
+        return
+
+    if command == "/status":
+        if user.get("address_key"):
+            status = "🟢 активна" if user.get("active") else "⚪ вимкнена"
+            _send(tg, chat_id,
+                  "<b>Ваша підписка</b>\n"
+                  f"Стан: {status}\n"
+                  f"Адреса: {_safe_text(user.get('address_label', '—'))}\n"
+                  f"Черга: <b>{_safe_text(user.get('group', '—'))}</b>\n"
+                  f"Останнє успішне оновлення: {_safe_text(user.get('last_ok') or 'ще не було')}")
+        else:
+            _send(tg, chat_id, "Адресу ще не налаштовано. Надішліть /start.")
+        return
+
+    if command == "/address":
+        user["flow"] = "city"
+        user["city_input"] = ""
+        user["street_input"] = ""
+        user["pending_matches"] = []
+        _send(tg, chat_id, "🏙️ Введіть назву населеного пункту (наприклад, Велика Лука).")
+        return
+
+    if command == "/start":
+        if user.get("address_key"):
+            if not user.get("active"):
+                user["active"] = True
+                user["snapshot"] = {}
+                user["message_id"] = None
+                _send(tg, chat_id,
+                      "✅ Підписку відновлено!\n"
+                      f"📍 {_safe_text(user.get('address_label', ''))}\n"
+                      f"🔢 Черга: <b>{_safe_text(user.get('group', ''))}</b>\n\n"
+                      "Актуальний графік надійде під час найближчої перевірки.")
             else:
-                raise
+                _send(tg, chat_id,
+                      "Ваша підписка вже активна ✅\n"
+                      f"📍 {_safe_text(user.get('address_label', ''))}\n"
+                      f"🔢 Черга: <b>{_safe_text(user.get('group', ''))}</b>\n\n"
+                      "Для зміни адреси: /address. Для допомоги: /help.")
+            return
+        user["flow"] = "city"
+        user["city_input"] = ""
+        user["street_input"] = ""
+        user["pending_matches"] = []
+        _send(tg, chat_id, WELCOME + "\n\n🏙️ <b>Крок 1/3.</b> Введіть назву населеного пункту:")
+        return
 
-    state.snapshot = snapshot
-    state.save()
+    flow = user.get("flow")
+    if not flow:
+        _send(tg, chat_id, "Щоб підключити графік, надішліть /start. Команди: /help.")
+        return
 
+    value = text.strip()
+    if not value:
+        _send(tg, chat_id, "Будь ласка, надішліть текстове значення або /cancel.")
+        return
 
-def _send_new(cfg: Config, tg: Telegram, state: State, png: bytes, caption: str,
-              delete_old: bool = True) -> None:
-    old_id = state.message_id
-    state.message_id = tg.send_photo(state.chat_id, png, caption)
-    state.save()
-    if cfg.delete_previous and delete_old and old_id:
+    if flow == "city":
+        user["city_input"] = value
+        user["flow"] = "street"
+        _send(tg, chat_id, "🛣️ <b>Крок 2/3.</b> Введіть назву вулиці (наприклад, Івана Франка).")
+        return
+
+    if flow == "street":
+        user["street_input"] = value
+        user["flow"] = "building"
+        _send(tg, chat_id, "🏠 <b>Крок 3/3.</b> Введіть номер будинку (наприклад, 24).")
+        return
+
+    if flow == "building":
+        _send(tg, chat_id, "🔎 Шукаю адресу в довіднику Тернопільобленерго. Перший пошук може зайняти кілька хвилин…")
         try:
-            tg.delete_message(state.chat_id, old_id)
-        except TelegramError as exc:
-            log.warning("Не вдалося видалити старе повідомлення %s: %s", old_id, exc)
+            matches = _find_matches_for_user(user, value, cfg, http)
+        except (ToeAPIError, ValueError) as exc:
+            log.warning("Address lookup failed for chat %s: %s", chat_id, exc)
+            _send(tg, chat_id,
+                  "⚠️ Не вдалося завершити пошук адреси. Перевірте написання та спробуйте ще раз командою /address.\n"
+                  f"Деталь: {_safe_text(str(exc)[:250])}")
+            user["flow"] = "building"
+            return
+        if not matches:
+            _send(tg, chat_id,
+                  "Не знайшов таку адресу в довіднику Тернопільобленерго. "
+                  "Перевірте назву населеного пункту, вулиці й номер будинку та повторіть /address.")
+            user["flow"] = None
+            return
+        if len(matches) == 1:
+            _activate_subscription(chat_id, user, matches[0], tg)
+            return
 
+        user["pending_matches"] = matches[:10]
+        user["flow"] = "choose"
+        lines = ["Знайшов кілька відповідних записів. Надішліть номер потрібного варіанта:"]
+        for index, candidate in enumerate(user["pending_matches"], 1):
+            lines.append(
+                f"{index}. {_safe_text(candidate['label'])} — черга <b>{_safe_text(candidate['group'] or 'не вказана')}</b>"
+            )
+        _send(tg, chat_id, "\n".join(lines))
+        return
 
-def _on_fetch_failure(cfg: Config, tg: Telegram, state: State, now: datetime, exc: Exception) -> None:
-    state.fail_count += 1
-    log.error("Не вдалося отримати графік (спроба поспіль №%d): %s", state.fail_count, exc)
-    if state.fail_count >= 3 and not state.error_notified and state.message_id:
-        text = (f"⚠️ <b>Не вдається оновити дані з сайту обленерго</b>\n"
-                f"Остання успішна перевірка: {state.last_ok or 'невідомо'}\n"
-                f"Показано останній відомий графік. Бот продовжує спроби.")
+    if flow == "choose":
         try:
-            tg.edit_caption(state.chat_id, state.message_id, text)
-            state.error_notified = True
-        except TelegramError as tg_exc:
-            log.warning("Не вдалося показати попередження: %s", tg_exc)
-    state.save()
+            choice = int(value)
+        except ValueError:
+            choice = 0
+        options = user.get("pending_matches", [])
+        if not (1 <= choice <= len(options)):
+            _send(tg, chat_id, f"Введіть номер від 1 до {len(options)} або /cancel.")
+            return
+        _activate_subscription(chat_id, user, options[choice - 1], tg)
+        return
+
+    user["flow"] = None
+    _send(tg, chat_id, "Сесію введення адреси скинуто. Надішліть /address, щоб почати знову.")
 
 
-# ───────────────────────────── режим --preview ─────────────────────────────
-def preview(cfg: Config) -> None:
-    tz = ZoneInfo(cfg.timezone)
+
+def bootstrap_skip_old_updates(tg: Telegram, state: dict[str, Any], store: StateStore) -> None:
+    """Discard stale pre-deployment chat history on first migration only.
+
+    Users should send /start after the first workflow run. This avoids processing
+    old test messages (for example, the old single-user bot's /start) as an address.
+    """
+    log.info("First run of multi-user version: clearing pre-deployment Telegram updates")
+    for _ in range(100):
+        updates = tg.get_updates(int(state.get("update_offset", 0)), limit=100)
+        if not updates:
+            break
+        state["update_offset"] = int(updates[-1].get("update_id", 0)) + 1
+        store.save(state)
+        if len(updates) < 100:
+            # Confirm the last batch and check whether any update arrived meanwhile.
+            continue
+    state["bootstrap_complete"] = True
+    store.save(state)
+    log.info("Bootstrap complete. Send /start to the bot to register your address.")
+
+
+def process_updates(tg: Telegram, state: dict[str, Any], cfg: Any, store: StateStore,
+                    http: requests.Session) -> None:
+    updates = tg.get_updates(int(state.get("update_offset", 0)))
+    if updates:
+        log.info("Отримано Telegram-оновлень: %d", len(updates))
+    for update in updates:
+        update_id = int(update.get("update_id", 0))
+        message = update.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
+        try:
+            if chat_id and chat.get("type") == "private":
+                text = message.get("text")
+                if isinstance(text, str):
+                    _handle_text(chat_id, text, state, tg, cfg, http)
+            # Only confirm an update after it was processed without an exception.
+            state["update_offset"] = update_id + 1
+            store.save(state)
+        except Exception:
+            log.exception("Не вдалося обробити Telegram update_id=%s", update_id)
+            # Keep this and subsequent updates unconfirmed so they can be retried.
+            break
+
+
+def _changed(old: dict[str, str], new: dict[str, str]) -> bool:
+    if not old:
+        return True
+    for day, slots in new.items():
+        if old.get(day) != slots:
+            return True
+    return False
+
+
+def _caption(user: dict[str, Any], checked_at: datetime, status: str) -> str:
+    return (
+        "⚡ <b>ГРАФІК ВІДКЛЮЧЕНЬ</b>\n"
+        f"📍 {_safe_text(user.get('address_label', ''))}\n"
+        f"🔢 Черга: <b>{_safe_text(user.get('group', ''))}</b>\n"
+        f"🕒 Оновлено: <b>{checked_at.strftime('%d.%m.%Y %H:%M')}</b> (Київ)\n\n"
+        f"{status}\n"
+        "Джерело: poweron.toe.com.ua"
+    )
+
+
+def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
+                          tz: ZoneInfo, http: requests.Session, store: StateStore) -> None:
+    users = state.setdefault("users", {})
+    active = [(chat_id, user) for chat_id, user in users.items()
+              if user.get("active") and user.get("address_key") and user.get("group")]
+    if not active:
+        log.info("Немає активних підписок")
+        return
+
     now = datetime.now(tz)
-    days = fetch_schedule(cfg.address_key, cfg.group, tz)
-    if not days:
-        print("Сайт відповів, але графіка на сьогодні/завтра для цієї адреси та черги немає.\n"
-              "Перевірте TOE_ADDRESS і GROUP у .env (див. README, розділ «Адреса»).")
-    for day, sched in sorted(days.items()):
-        print(f"\n{day:%d.%m.%Y}  (дані від {sched.created or '—'})  черга {cfg.group}")
-        rows = intervals_of(sched.slots)
-        if not rows:
-            print("  🟢 відключень немає")
-        for code, a, b in rows:
-            icon = "🔴" if code == OFF else "🟡"
-            print(f"  {icon} {fmt_range(a, b)}  ({fmt_duration((b - a) * 30)})")
-        print(f"  разом без світла: {fmt_duration(count_minutes(sched.slots, OFF)) or '0 хв'}")
-    png = render_png(build_views(days, now.date()), cfg.address_label, cfg.group, "nochange", now,
-                     max(1, cfg.interval_seconds // 60))
-    out = BASE_DIR / "preview.png"
-    out.write_bytes(png)
-    print(f"\nКартинку збережено: {out}")
+    schedule_cache: dict[str, dict[str, dict[str, str]] | Exception] = {}
+    for chat_id, user in active:
+        identity = f"{user['address_key']}|{user['group']}"
+        if identity not in schedule_cache:
+            try:
+                schedules = fetch_schedule(user["address_key"], user["group"], tz, session=http)
+                if not schedules:
+                    raise ToeAPIError("Сайт поки не повернув графік на сьогодні або завтра")
+                schedule_cache[identity] = schedules
+            except Exception as exc:
+                schedule_cache[identity] = exc
+
+        result = schedule_cache[identity]
+        if isinstance(result, Exception):
+            user["fail_count"] = int(user.get("fail_count", 0)) + 1
+            log.warning("Schedule fetch failed for subscription %s: %s", identity, result)
+            if user["fail_count"] >= 3 and not user.get("error_notified"):
+                try:
+                    if user.get("snapshot"):
+                        warning = "Показую останній отриманий графік і продовжую спроби. "
+                    else:
+                        warning = "Поки не вдалося отримати перший графік; продовжую спроби. "
+                    _send(tg, chat_id,
+                          "⚠️ <b>Тимчасово не вдається оновити графік.</b>\n"
+                          + warning + "Це не означає, що відключень немає.")
+                    user["error_notified"] = True
+                except TelegramError:
+                    log.exception("Не вдалося надіслати повідомлення про збій")
+            store.save(state)
+            continue
+
+        snapshot = {day: item["slots"] for day, item in sorted(result.items())}
+        old_snapshot = user.get("snapshot") or {}
+        changed = _changed(old_snapshot, snapshot)
+        if not old_snapshot:
+            status = "✅ Перший актуальний графік для цієї підписки."
+        elif changed:
+            status = "🔔 <b>ГРАФІК ЗМІНИВСЯ!</b> Надсилаю оновлення."
+        else:
+            status = "✅ Змін немає — графік перевірено."
+        caption = _caption(user, now, status)
+        png = render_schedule_png(result, user["address_label"], user["group"], now)
+
+        try:
+            message_id = user.get("message_id")
+            if message_id and not changed:
+                try:
+                    tg.edit_photo(chat_id, int(message_id), png, caption)
+                except TelegramError as exc:
+                    if not exc.not_modified and not exc.message_gone:
+                        log.warning("Не вдалося редагувати фото в чаті %s; надсилаю нове: %s", chat_id, exc)
+                        user["message_id"] = tg.send_photo(chat_id, png, caption)
+                    elif exc.message_gone:
+                        user["message_id"] = tg.send_photo(chat_id, png, caption)
+            else:
+                user["message_id"] = tg.send_photo(chat_id, png, caption)
+
+            user["snapshot"] = snapshot
+            user["last_ok"] = now.strftime("%d.%m.%Y %H:%M")
+            user["fail_count"] = 0
+            if user.get("error_notified"):
+                _send(tg, chat_id, "✅ Зв'язок із сайтом відновлено, графік знову оновлюється.")
+            user["error_notified"] = False
+            user["no_schedule_notified"] = False
+        except Exception:
+            log.exception("Не вдалося оновити повідомлення підписки для чату %s", chat_id)
+        store.save(state)
 
 
-# ───────────────────────────── точка входу ─────────────────────────────
-def setup_logging(log_file: str = "bot.log") -> None:
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    root.addHandler(console)
-    if log_file:
-        file_handler = RotatingFileHandler(BASE_DIR / log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-        file_handler.setFormatter(fmt)
-        root.addHandler(file_handler)
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--once", action="store_true", help="одна перевірка й вихід")
-    parser.add_argument("--preview", action="store_true", help="лише завантажити графік і зберегти preview.png")
+    parser = argparse.ArgumentParser(description="Public multi-user TOE outage schedule bot")
+    parser.add_argument("--once", action="store_true", help="one processing cycle (default)")
     args = parser.parse_args()
 
     cfg = load_config()
-    setup_logging(cfg.log_file)
-
-    if args.preview:
-        preview(cfg)
-        return
-
+    setup_logging(cfg.log_level)
+    store = StateStore(cfg.state_file, cfg.state_encryption_key)
+    state = store.load()
     tz = ZoneInfo(cfg.timezone)
     tg = Telegram(cfg.bot_token)
-    state = State.load(cfg.state_file)
-
-    chat_id = cfg.chat_id or state.chat_id
-    if not chat_id:
-        try:
-            chat_id = tg.detect_chat_id() or ""
-        except TelegramError as exc:
-            raise SystemExit(f"Не вдалося перевірити токен / отримати чат: {exc}")
-    if not chat_id:
-        raise SystemExit("Не знайдено чат. Відкрийте свого бота в Telegram, натисніть /start і запустіть знову "
-                         "(або вкажіть TELEGRAM_CHAT_ID у .env).")
-    if chat_id != state.chat_id:  # інший чат → починаємо з нового повідомлення
-        state.chat_id, state.message_id, state.snapshot = chat_id, None, None
-        state.save()
-
-    log.info("Старт. Адреса: %s · черга %s · інтервал %d с · чат %s",
-             cfg.address_label, cfg.group, cfg.interval_seconds, state.chat_id)
-
     http = requests.Session()
-    while True:
-        started = time.monotonic()
-        try:
-            run_cycle(cfg, tg, tz, state, http)
-        except TelegramError as exc:
-            log.error("Помилка Telegram: %s", exc)
-        except Exception:  # бот не має падати через разовий збій
-            log.exception("Непередбачена помилка в циклі")
-        if args.once:
-            return
-        time.sleep(max(5.0, cfg.interval_seconds - (time.monotonic() - started)))
+    http.headers.update({"User-Agent": "TOE-Outage-Bot/2.0"})
+
+    # Ensure long polling is usable; do not discard users' pending messages.
+    tg.delete_webhook()
+    if not state.get("bootstrap_complete", False):
+        bootstrap_skip_old_updates(tg, state, store)
+    else:
+        process_updates(tg, state, cfg, store, http)
+    process_subscriptions(tg, state, cfg, tz, http, store)
+    store.save(state)
+    log.info("Cycle complete. Active subscriptions: %d", sum(1 for u in state["users"].values() if u.get("active")))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nЗупинено.")
+    main()

@@ -1,84 +1,102 @@
-"""Мінімальна обгортка над Telegram Bot API (лише requests, без зайвих залежностей)."""
+"""Small Telegram Bot API client (long-polling via getUpdates)."""
 from __future__ import annotations
 
 import json
 import logging
 import time
+from typing import Any
 
 import requests
 
-log = logging.getLogger("tg")
+log = logging.getLogger("telegram")
 
 
-class TelegramError(Exception):
+class TelegramError(RuntimeError):
     def __init__(self, code: int | None, description: str):
         super().__init__(f"Telegram {code}: {description}")
         self.code = code
         self.description = description or ""
 
     @property
-    def not_modified(self) -> bool:
-        return "message is not modified" in self.description
+    def message_gone(self) -> bool:
+        lower = self.description.lower()
+        return any(part in lower for part in (
+            "message to edit not found", "message_id_invalid", "message can't be edited",
+            "message to delete not found", "there is no photo in the request",
+        ))
 
     @property
-    def message_gone(self) -> bool:
-        d = self.description.lower()
-        return any(x in d for x in ("message to edit not found", "message_id_invalid",
-                                    "message can't be edited", "message to delete not found"))
+    def not_modified(self) -> bool:
+        return "message is not modified" in self.description.lower()
 
 
 class Telegram:
     def __init__(self, token: str):
-        self._base = f"https://api.telegram.org/bot{token}"
-        self._http = requests.Session()
+        self.base = f"https://api.telegram.org/bot{token}"
+        self.http = requests.Session()
 
-    def _call(self, method: str, data: dict | None = None, files: dict | None = None,
-              timeout: int = 40, _retry: bool = True):
+    def _call(self, method: str, *, data: dict[str, Any] | None = None,
+              files: dict[str, Any] | None = None, timeout: int = 45,
+              retry_429: bool = True) -> Any:
         try:
-            resp = self._http.post(f"{self._base}/{method}", data=data, files=files, timeout=timeout)
+            response = self.http.post(f"{self.base}/{method}", data=data, files=files, timeout=timeout)
         except requests.RequestException as exc:
             raise TelegramError(None, f"мережева помилка: {exc}") from exc
         try:
-            body = resp.json()
-        except ValueError:
-            raise TelegramError(resp.status_code, resp.text[:200])
-        if body.get("ok"):
-            return body["result"]
-        code, desc = body.get("error_code"), body.get("description", "")
-        retry_after = (body.get("parameters") or {}).get("retry_after")
-        if code == 429 and retry_after and _retry:
-            log.warning("Telegram просить зачекати %s с", retry_after)
-            time.sleep(int(retry_after) + 1)
-            return self._call(method, data, files, timeout, _retry=False)
-        raise TelegramError(code, desc)
+            payload = response.json()
+        except ValueError as exc:
+            raise TelegramError(response.status_code, response.text[:300]) from exc
+        if payload.get("ok"):
+            return payload.get("result")
+        code = payload.get("error_code")
+        description = payload.get("description", "невідома помилка")
+        retry_after = (payload.get("parameters") or {}).get("retry_after")
+        if code == 429 and retry_after and retry_429:
+            wait = min(int(retry_after) + 1, 60)
+            log.warning("Telegram rate limit; повтор через %s с", wait)
+            time.sleep(wait)
+            return self._call(method, data=data, files=files, timeout=timeout, retry_429=False)
+        raise TelegramError(code, description)
 
-    # ── повідомлення ──
+    def delete_webhook(self) -> None:
+        # getUpdates and webhooks are mutually exclusive; keep pending messages.
+        self._call("deleteWebhook", data={"drop_pending_updates": "false"})
+
+    def get_updates(self, offset: int, limit: int = 100) -> list[dict[str, Any]]:
+        result = self._call("getUpdates", data={
+            "offset": offset,
+            "limit": max(1, min(100, limit)),
+            "timeout": 0,
+            "allowed_updates": json.dumps(["message"]),
+        }, timeout=30)
+        return result or []
+
+    def send_message(self, chat_id: str, text: str) -> int:
+        result = self._call("sendMessage", data={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        })
+        return int(result["message_id"])
+
     def send_photo(self, chat_id: str, png: bytes, caption: str) -> int:
-        res = self._call("sendPhoto",
-                         data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
-                         files={"photo": ("schedule.png", png, "image/png")})
-        return res["message_id"]
+        result = self._call("sendPhoto", data={
+            "chat_id": chat_id,
+            "caption": caption,
+            "parse_mode": "HTML",
+        }, files={"photo": ("schedule.png", png, "image/png")})
+        return int(result["message_id"])
 
     def edit_photo(self, chat_id: str, message_id: int, png: bytes, caption: str) -> None:
-        media = {"type": "photo", "media": "attach://photo", "caption": caption, "parse_mode": "HTML"}
-        self._call("editMessageMedia",
-                   data={"chat_id": chat_id, "message_id": message_id, "media": json.dumps(media, ensure_ascii=False)},
-                   files={"photo": ("schedule.png", png, "image/png")})
-
-    def edit_caption(self, chat_id: str, message_id: int, caption: str) -> None:
-        self._call("editMessageCaption",
-                   data={"chat_id": chat_id, "message_id": message_id,
-                         "caption": caption, "parse_mode": "HTML"})
-
-    def delete_message(self, chat_id: str, message_id: int) -> None:
-        self._call("deleteMessage", data={"chat_id": chat_id, "message_id": message_id})
-
-    # ── допоміжне ──
-    def detect_chat_id(self) -> str | None:
-        """Шукає чат, у якому з ботом уже писали (потрібно спершу натиснути /start)."""
-        updates = self._call("getUpdates", data={"limit": 20, "timeout": 0})
-        for upd in reversed(updates):
-            msg = upd.get("message") or upd.get("my_chat_member") or upd.get("edited_message")
-            if msg and msg.get("chat", {}).get("id") is not None:
-                return str(msg["chat"]["id"])
-        return None
+        media = {
+            "type": "photo",
+            "media": "attach://photo",
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+        self._call("editMessageMedia", data={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "media": json.dumps(media, ensure_ascii=False),
+        }, files={"photo": ("schedule.png", png, "image/png")})

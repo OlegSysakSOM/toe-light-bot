@@ -1,10 +1,11 @@
-# секрети та локальний стан — не кладіть у репозиторій!
 .env
-data/
-state.json
-state.enc
-bot.log
-preview.png
-demo_*.png
+.env.*
+!.env.example
 __pycache__/
-.venv/
+*.py[cod]
+*.log
+*.tmp
+state.json
+preview.png
+
+.cache/
