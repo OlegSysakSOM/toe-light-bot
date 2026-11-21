@@ -500,3 +500,28 @@ def test_reference_png_is_600px_wide():
     with Image.open(BytesIO(png)) as image:
         assert image.width == 600
         assert image.height > 500
+
+
+
+def test_shared_schedule_change_predicate_and_photo_sender():
+    from bot import schedule_snapshot_changed, send_schedule_change_photo
+
+    current = {"2026-11-21": "0" * 48}
+    unchanged_previous = {"2026-11-21": "0" * 48}
+    changed_previous = {"2026-11-21": "1" + "0" * 47}
+
+    assert schedule_snapshot_changed(unchanged_previous, current) is False
+    assert schedule_snapshot_changed(changed_previous, current) is True
+    assert schedule_snapshot_changed({}, current) is False
+
+    class FakeTelegram:
+        def __init__(self):
+            self.sent = []
+        def send_photo(self, chat_id, png, caption):
+            self.sent.append((chat_id, png, caption))
+            return 4321
+
+    tg = FakeTelegram()
+    message_id = send_schedule_change_photo(tg, "12345", b"test-png", "test-caption")
+    assert message_id == 4321
+    assert tg.sent == [("12345", b"test-png", "test-caption")]

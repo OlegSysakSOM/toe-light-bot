@@ -462,6 +462,16 @@ def _changed(old: dict[str, str], new: dict[str, str]) -> bool:
     return False
 
 
+def schedule_snapshot_changed(previous: dict[str, str], current: dict[str, str]) -> bool:
+    """Return True only for a non-empty previous snapshot that differs from live slots."""
+    return bool(previous) and current != previous
+
+
+def send_schedule_change_photo(tg: Telegram, chat_id: str, png: bytes, caption: str) -> int:
+    """Shared delivery path for real change alerts and the isolated notification test."""
+    return tg.send_photo(str(chat_id), png, caption)
+
+
 def _caption(user: dict[str, Any], checked_at: datetime, status: str) -> str:
     return (
         "⚡ <b>ГРАФІК ВІДКЛЮЧЕНЬ</b>\n"
@@ -521,7 +531,7 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
             continue
 
         # Full comparison ignores source timestamps and checks all dates/48 half-hour slots.
-        if snapshot == previous:
+        if not schedule_snapshot_changed(previous, snapshot):
             stats["unchanged"] += 1
             log.info("Графік не змінився — нічого не надсилаю: %s", identity)
             continue
@@ -531,7 +541,7 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
         png = render_schedule_png(result, user["address_label"], user["group"], now)
         try:
             # Do not edit previous messages. A real change always makes a new photo message.
-            message_id = tg.send_photo(chat_id, png, caption)
+            message_id = send_schedule_change_photo(tg, chat_id, png, caption)
             user["message_id"] = message_id
             user["snapshot"] = snapshot
             user["last_ok"] = now.strftime("%d.%m.%Y %H:%M")

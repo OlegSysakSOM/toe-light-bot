@@ -22,3 +22,7 @@ Cloudflare Worker secret:
 - `GITHUB_ACTIONS_TOKEN` — fine-grained PAT, restricted to this repository, with Actions: Read and write.
 
 The PNG renderer uses the Inter font files in `fonts/`.
+
+## Safe test notification
+
+Run `.github/workflows/test-change-notification.yml` manually with your own active Telegram chat ID. It reads the subscription and live schedule, flips one slot only in an in-memory copy, uses the same snapshot comparator and photo delivery helper as the production automatic alert, and sends exactly one clearly marked test PNG to that chat. It performs no writes to D1 and does not notify other users.
