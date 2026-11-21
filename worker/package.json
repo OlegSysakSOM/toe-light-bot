@@ -2,7 +2,7 @@
   "name": "toe-public-bot-worker",
   "private": true,
   "type": "module",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",

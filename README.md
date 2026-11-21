@@ -1,4 +1,4 @@
-# TOE Public Bot 2.2.0 — webhook + 10-minute outage refresh
+# TOE Public Bot 2.3.0 — webhook + 10-minute outage refresh
 
 This release separates fast Telegram interaction from schedule refresh:
 
@@ -10,6 +10,10 @@ This release separates fast Telegram interaction from schedule refresh:
 ## Full deployment guide
 
 Read `DEPLOY_CLOUDFLARE.md` from top to bottom. Do not use the old 2.1 workflow that runs `python bot.py --once`: it polls Telegram with `getUpdates` and deletes webhook configuration. The new scheduled workflow runs `schedule_job.py` only.
+
+## Live schedule retrieval
+
+Pressing **📊 Мій графік** now fetches the current schedule directly from the official TOE API and sends the current/tomorrow half-hour intervals immediately. The same live fetch is attempted after a new address is activated. Identical address/queue/date requests use a short edge cache to reduce load. The 10-minute GitHub Actions job remains responsible for the designed PNG message and automatic edit/change notifications.
 
 ## Button menu
 

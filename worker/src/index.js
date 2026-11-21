@@ -67,6 +67,105 @@ async function answerCallback(env, id, text = "") {
   return telegram(env, "answerCallbackQuery", { callback_query_id: id, text: text.slice(0, 180) });
 }
 
+const TOE_SCHEDULE_ENDPOINT = "https://api-poweron.toe.com.ua/api/a_gpv_g";
+const TOE_ORIGIN = "https://poweron.toe.com.ua";
+
+function kyivDate(offsetDays = 0) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Kyiv", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const d = new Date(Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day) + offsetDays));
+  return d.toISOString().slice(0, 10);
+}
+
+function formatIntervals(times) {
+  const raw = { "0": "🟢 Світло", "1": "🔴 Відключення", "10": "🟡 Можливе" };
+  const slots = [];
+  for (let h = 0; h < 24; h++) for (const m of [0, 30]) {
+    const value = String(times?.[`${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`] ?? "0");
+    slots.push(raw[value] || "⚪ Невідомо");
+  }
+  const runs = [];
+  for (let i = 0; i < slots.length; i++) {
+    const state = slots[i];
+    if (runs.length && runs[runs.length - 1].state === state) runs[runs.length - 1].end = i + 1;
+    else runs.push({ state, start: i, end: i + 1 });
+  }
+  return runs.map((r) => {
+    const fmt = (slot) => slot === 48 ? "24:00" : `${String(Math.floor(slot / 2)).padStart(2, "0")}:${slot % 2 ? "30" : "00"}`;
+    return `${fmt(r.start)}–${fmt(r.end)} ${r.state}`;
+  }).join("\n");
+}
+
+async function ctxCachePut(cache, key, response) { try { await cache.put(key, response); } catch (error) { console.warn("Schedule cache write skipped", error); } }
+
+async function fetchLiveSchedule(user) {
+  const addressKey = String(user.address_key || "");
+  const group = String(user.group_name || "").trim();
+  if (!addressKey || !group) throw new Error("Спочатку додайте адресу та чергу.");
+  const after = `${kyivDate(-1)}T12:00:00+00:00`;
+  const before = `${kyivDate(1)}T23:59:59+00:00`;
+  const params = new URLSearchParams({ before, after, "group[]": group, time: addressKey.replaceAll("/", "") });
+  const requestUrl = `${TOE_SCHEDULE_ENDPOINT}?${params}`;
+  const cacheKey = new Request(`https://toe-schedule-cache.invalid/${encodeURIComponent(addressKey)}?group=${encodeURIComponent(group)}&after=${after.slice(0, 10)}&before=${before.slice(0, 10)}`);
+  const cache = caches.default;
+  const debugKey = btoa(unescape(encodeURIComponent(addressKey)));
+  let response = await cache.match(cacheKey);
+  if (!response) response = await fetch(requestUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; TOE-Public-Outage-Bot/2.3)",
+      "Accept": "application/json", "Origin": TOE_ORIGIN, "Referer": `${TOE_ORIGIN}/`,
+      "X-debug-key": debugKey,
+    },
+    signal: AbortSignal.timeout(12000),
+  });
+  if (!response.ok) throw new Error(`Сайт обленерго відповів HTTP ${response.status}`);
+  if (!response.headers.get("cf-cache-status")) {
+    const cached = new Response(await response.clone().arrayBuffer(), {
+      headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=30" },
+    });
+    ctxCachePut(cache, cacheKey, cached);
+  }
+  const payload = await response.json();
+  const members = Array.isArray(payload) ? payload : (payload?.["hydra:member"] || payload?.member || []);
+  const today = kyivDate(0);
+  const tomorrow = kyivDate(1);
+  const days = [];
+  for (const member of members) {
+    let data = member?.dataJson;
+    if (typeof data === "string") { try { data = JSON.parse(data); } catch { continue; } }
+    const day = String(member?.dateGraph || "").slice(0, 10);
+    if (![today, tomorrow].includes(day)) continue;
+    const groupData = data?.[group] || Object.entries(data || {}).find(([k]) => k.trim() === group)?.[1];
+    if (!groupData?.times) continue;
+    const created = String(member?.dateCreate || "");
+    const existing = days.findIndex((d) => d.day === day);
+    const item = { day, created, times: groupData.times };
+    if (existing < 0) days.push(item); else if (created >= days[existing].created) days[existing] = item;
+  }
+  days.sort((a, b) => a.day.localeCompare(b.day));
+  if (!days.length) throw new Error("Сайт поки не повернув графік на сьогодні або завтра. Спробуйте трохи пізніше.");
+  return days;
+}
+
+async function sendFreshSchedule(env, user, chatId) {
+  await sendMessage(env, chatId, "🔄 Отримую актуальний графік безпосередньо із сайту Тернопільобленерго…", user);
+  try {
+    const days = await fetchLiveSchedule(user);
+    const updated = new Intl.DateTimeFormat("uk-UA", { timeZone: "Europe/Kyiv", dateStyle: "short", timeStyle: "short" }).format(new Date());
+    for (const day of days) {
+      const title = day.day === kyivDate(0) ? "СЬОГОДНІ" : "ЗАВТРА";
+      const body = formatIntervals(day.times);
+      await sendMessage(env, chatId,
+        `⚡ <b>АКТУАЛЬНИЙ ГРАФІК — ${title}</b>\n📍 ${escapeHtml(user.address_label)}\n🔢 Черга: <b>${escapeHtml(user.group_name)}</b>\n📅 ${day.day}\n🕒 Отримано із сайту: ${updated} (Київ)\n\n<pre>${escapeHtml(body)}</pre>\n🟢 Світло · 🔴 Відключення · 🟡 Можливе`, user);
+    }
+  } catch (error) {
+    await sendMessage(env, chatId,
+      `⚠️ Не вдалося отримати свіжий графік із сайту: ${escapeHtml(error?.message || String(error))}\nЦе не означає, що відключень немає. Автоматична перевірка продовжить роботу.`, user);
+  }
+}
+
 function freshUser(chatId, message) {
   return {
     chat_id: String(chatId),
@@ -161,7 +260,7 @@ async function addressMatches(env, city, street, building) {
   return matches.slice(0, 10);
 }
 
-async function activate(env, user, candidate) {
+async function activate(env, user, candidate, ctx) {
   user.active = 1;
   user.flow = null;
   user.pending_matches = [];
@@ -176,7 +275,8 @@ async function activate(env, user, candidate) {
   user.last_ok = "";
   await saveUser(env, user);
   await sendMessage(env, user.chat_id,
-    `✅ <b>Підписку активовано!</b>\n\n📍 ${escapeHtml(user.address_label)}\n🔢 Черга: <b>${escapeHtml(user.group_name)}</b>\n\nГрафік буде надіслано під час найближчого циклу перевірки (до приблизно 10 хвилин).`, user);
+    `✅ <b>Підписку активовано!</b>\n\n📍 ${escapeHtml(user.address_label)}\n🔢 Черга: <b>${escapeHtml(user.group_name)}</b>\n\nЗараз спробую отримати актуальний графік із сайту. Далі автоматичні перевірки працюватимуть приблизно кожні 10 хвилин.`, user);
+  ctx?.waitUntil?.(sendFreshSchedule(env, user, user.chat_id));
 }
 
 function escapeHtml(value) {
@@ -195,7 +295,7 @@ async function beginAddress(env, user, change) {
   await sendMessage(env, user.chat_id, `${prefix}<b>Крок 1/3.</b> Введіть населений пункт.`, user);
 }
 
-async function handleText(env, message) {
+async function handleText(env, message, ctx) {
   const chat = message.chat || {};
   if (chat.type !== "private") return;
   const chatId = String(chat.id);
@@ -229,10 +329,14 @@ async function handleText(env, message) {
     let lastCheck = "ще не було";
     const meta = await env.DB.prepare("SELECT value FROM bot_meta WHERE key = 'last_schedule_check_at'").first();
     if (meta?.value) lastCheck = String(meta.value);
-    const text = user.address_key
-      ? `<b>Ваша підписка</b>\nСтан: ${user.active ? "🟢 активна" : "⚪ вимкнена"}\nАдреса: ${escapeHtml(user.address_label)}\nЧерга: <b>${escapeHtml(user.group_name)}</b>\nОстання перевірка графіків: ${escapeHtml(lastCheck)}`
-      : "Адресу ще не налаштовано. Натисніть «➕ Додати адресу».";
-    await sendMessage(env, chatId, text, user); return;
+    if (user.address_key) {
+      await sendMessage(env, chatId,
+        `<b>Ваша підписка</b>\nСтан: ${user.active ? "🟢 активна" : "⚪ вимкнена"}\nАдреса: ${escapeHtml(user.address_label)}\nЧерга: <b>${escapeHtml(user.group_name)}</b>\nОстанній фоновий цикл: ${escapeHtml(lastCheck)}\n\nЗараз отримую свіжі дані із сайту…`, user);
+      ctx?.waitUntil?.(sendFreshSchedule(env, user, chatId));
+    } else {
+      await sendMessage(env, chatId, "Адресу ще не налаштовано. Натисніть «➕ Додати адресу».", user);
+    }
+    return;
   }
   if (value === BTN_STOP || command === "/stop") {
     if (user.address_key) { user.active = 0; user.flow = null; await saveUser(env, user); await sendMessage(env, chatId, "🔕 Сповіщення вимкнено.", user); }
@@ -273,7 +377,7 @@ async function handleText(env, message) {
       await sendMessage(env, chatId, "Не знайшов адресу з такою назвою та номером будинку. Перевірте написання та натисніть «➕ Додати адресу» або «✏️ Змінити адресу», щоб повторити.", user);
       return;
     }
-    if (matches.length === 1) { await activate(env, user, matches[0]); return; }
+    if (matches.length === 1) { await activate(env, user, matches[0], ctx); return; }
     user.pending_matches = matches; user.flow = "choose"; await saveUser(env, user);
     const keyboard = matches.map((item, i) => [{
       text: `${i + 1}. ${item.address_label} · черга ${item.group_name}`.slice(0, 64),
@@ -284,7 +388,7 @@ async function handleText(env, message) {
   }
 }
 
-async function handleCallback(env, callback) {
+async function handleCallback(env, callback, ctx) {
   const callbackId = String(callback.id || "");
   const chat = callback.message?.chat || {};
   if (!callbackId) return;
@@ -296,12 +400,12 @@ async function handleCallback(env, callback) {
   const candidate = user.pending_matches[index];
   if (!candidate) { await answerCallback(env, callbackId, "Адресу не знайдено. Спробуйте ще раз."); return; }
   await answerCallback(env, callbackId, "Адресу вибрано.");
-  await activate(env, user, candidate);
+  await activate(env, user, candidate, ctx);
 }
 
-async function handleUpdate(env, update) {
-  if (update.callback_query) await handleCallback(env, update.callback_query);
-  else if (update.message) await handleText(env, update.message);
+async function handleUpdate(env, update, ctx) {
+  if (update.callback_query) await handleCallback(env, update.callback_query, ctx);
+  else if (update.message) await handleText(env, update.message, ctx);
 }
 
 function authorized(request, env) {
@@ -310,12 +414,12 @@ function authorized(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       const row = await env.DB.prepare("SELECT COUNT(*) AS users FROM users").first();
       const idx = await env.DB.prepare("SELECT COUNT(*) AS records FROM address_index").first();
-      return Response.json({ ok: true, users: row?.users || 0, address_records: idx?.records || 0, version: "2.2.0" });
+      return Response.json({ ok: true, users: row?.users || 0, address_records: idx?.records || 0, version: "2.3.0" });
     }
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) {
@@ -328,7 +432,7 @@ export default {
           const seen = await env.DB.prepare("SELECT update_id FROM processed_updates WHERE update_id = ?").bind(updateId).first();
           if (seen) return Response.json({ ok: true, duplicate: true });
         }
-        await handleUpdate(env, update);
+        await handleUpdate(env, update, ctx);
         if (Number.isFinite(updateId)) {
           await env.DB.prepare("INSERT OR IGNORE INTO processed_updates(update_id) VALUES (?)").bind(updateId).run();
         }
