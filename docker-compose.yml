@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped        # сам піднімається після збою й перезавантаження сервера
+    env_file: .env
+    volumes:
+      - ./data:/app/data           # тут зберігається state.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

@@ -1,0 +1,4 @@
+requests>=2.31
+Pillow>=10.0
+tzdata   # потрібне лише на Windows для часових зон
+cryptography>=42.0

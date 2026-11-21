@@ -1,0 +1,10 @@
+.env
+.git
+data
+state.json
+bot.log
+preview.png
+demo_*.png
+__pycache__
+*.pyc
+.venv

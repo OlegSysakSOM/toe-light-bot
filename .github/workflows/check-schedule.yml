@@ -1,0 +1,56 @@
+name: Оновлення графіка відключень
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: toe-light-schedule
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Отримати код і попередній стан
+        uses: actions/checkout@v4
+
+      - name: Встановити Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Встановити залежності
+        run: pip install -r requirements.txt
+
+      - name: Перевірити графік і оновити Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TOE_ADDRESS: ${{ secrets.TOE_ADDRESS }}
+          STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
+          GROUP: "5.1"
+          ADDRESS_LABEL: ${{ secrets.ADDRESS_LABEL }}
+          CHECK_INTERVAL_SECONDS: "900"
+          TIMEZONE: Europe/Kyiv
+          STATE_FILE: state.enc
+          LOG_FILE: ""
+        run: python bot.py --once
+
+      - name: Зберегти зашифрований стан для наступного запуску
+        if: always()
+        run: |
+          if [ -f state.enc ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f state.enc
+            if ! git diff --cached --quiet; then
+              git commit -m "Update encrypted bot state [skip ci]"
+              git push
+            fi
+          fi

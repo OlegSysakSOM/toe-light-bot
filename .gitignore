@@ -1,0 +1,10 @@
+# секрети та локальний стан — не кладіть у репозиторій!
+.env
+data/
+state.json
+state.enc
+bot.log
+preview.png
+demo_*.png
+__pycache__/
+.venv/
