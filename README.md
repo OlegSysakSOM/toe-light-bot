@@ -1,47 +1,38 @@
-# Публічний Telegram-бот графіків Тернопільобленерго
+# TOE Public Bot 2.2.0 — webhook + 10-minute outage refresh
 
-Це багатокористувацька версія: кожна людина відкриває бота в особистому чаті та користується кнопками меню «➕ Додати адресу», «✏️ Змінити адресу», «📊 Мій графік», «🔕/🔔 Сповіщення». Після натискання кнопки введіть населений пункт, вулицю й номер будинку. Бот шукає адресу в довіднику `poweron.toe.com.ua`, визначає чергу `chergGpv` і зберігає окрему підписку. Кожен користувач має одну адресу на особистий чат і отримує тільки власний графік.
+This release separates fast Telegram interaction from schedule refresh:
 
-## Можливості
+- Cloudflare Worker handles Telegram webhook updates and inline/reply buttons in real time.
+- Cloudflare D1 stores users, their private chat subscriptions and the public TOE address directory.
+- GitHub Actions runs `schedule_job.py` every 10 minutes, downloads/compares outage schedules and sends/edits personalized photos.
+- A separate workflow imports/refreshes the TOE public address directory in D1 weekly and on manual request.
 
-- Кнопки меню — основний інтерфейс для додавання/зміни адреси, перегляду статусу та керування сповіщеннями.
-- `/start`, `/address`, `/status`, `/stop`, `/cancel`, `/help` залишені як резервні команди, але використовувати їх не потрібно.
-- Окремий стан і `message_id` для кожного приватного чату.
-- Один запит графіка для всіх підписок з однаковою адресою/чергою в межах циклу.
-- Публічний довідник адрес кешується через GitHub Actions Cache: перше завантаження сканує сторінки TOE, наступні користувачі знаходяться локально без повторного сканування всього довідника.
-- Нове фото при зміні графіка; редагування попереднього фото, якщо змін немає.
-- Зашифрована база підписок, Telegram update offset і кеш знайдених вулиць зберігаються у `state.enc`.
+## Full deployment guide
 
-## Частота команд і графіків
+Read `DEPLOY_CLOUDFLARE.md` from top to bottom. Do not use the old 2.1 workflow that runs `python bot.py --once`: it polls Telegram with `getUpdates` and deletes webhook configuration. The new scheduled workflow runs `schedule_job.py` only.
 
-GitHub Actions запускає короткий цикл приблизно кожні **5 хвилин** (на 3-й, 8-й, 13-й тощо хвилинах години), щоб прийняти Telegram-повідомлення, натискання кнопок і кроки введення адреси. Тому затримка реакції зазвичай становить до 5 хвилин, але GitHub може запізнюватися.
+## Button menu
 
-Оновлення графіків сайту перевіряються окремо — приблизно кожні **15 хвилин**. Після першого підключення адреси або відновлення сповіщень перевірка графіка запускається примусово в тому самому циклі.
+The persistent keyboard always shows all actions, including during address entry. It no longer collapses to only Cancel and Help:
 
-Це не постійний процес 24/7: це короткий cloud-run кожні 5 хвилин (на 3-й, 8-й, 13-й тощо хвилинах години). Точний час старту не гарантується GitHub. Telegram зберігає необроблені updates не довше 24 годин; якщо workflow не працює понад добу, частина повідомлень може втратитися.
+- Add address
+- Change address
+- My schedule
+- Pause/resume notifications
+- Cancel current address entry
+- Help
 
-## Локальний запуск/перевірка
+If the old 2.1 bot showed only Cancel and Help, it was in an unfinished address-entry flow. Press Cancel once or deploy 2.2.0; the new keyboard always exposes the full menu.
 
-1. Встановіть Python 3.12+.
-2. `python -m pip install -r requirements.txt`
-3. Створіть `.env` на основі `.env.example`, додайте `TELEGRAM_BOT_TOKEN` і `STATE_ENCRYPTION_KEY`.
-4. `python bot.py --once`
+## Required GitHub Actions secrets
 
-Не запускайте локальний процес одночасно з GitHub Actions для того самого токена: обидва процеси використовують `getUpdates` і можуть конфліктувати. В робочому режимі Telegram updates обробляються раз на ~5 хвилин, графіки — раз на ~15 хвилин.
+- `TELEGRAM_BOT_TOKEN`
+- `CLOUDFLARE_API_TOKEN` — Cloudflare API token with D1 Edit permission for this account
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_D1_DATABASE_ID`
 
-## Дані та приватність
+The old `STATE_ENCRYPTION_KEY` is no longer used by the 2.2 architecture. Keep it temporarily until the new setup is verified; after migration, the live subscriptions reside in Cloudflare D1.
 
-Усі персональні підписки зберігаються у зашифрованому `state.enc` за допомогою Fernet. У репозиторій не потрапляє відкритий `.env`, токен або відкрита база адрес користувачів. Сам код у Public-репозиторії відкритий. Не втрачайте `STATE_ENCRYPTION_KEY`: без нього зчитати `state.enc` неможливо.
+## Limits and reliability
 
-Бот приймає команди тільки в особистих чатах, щоб не розкривати адресу одного користувача іншим учасникам групи. Адреса й черга потрібні для запиту графіка; користувач може вимкнути або відновити підписку кнопкою меню.
-
-## Обмеження
-
-- Підтримуються адреси, які присутні в довіднику Тернопільобленерго та мають чергу ГПВ.
-- Адресний кеш має ключ `toe-address-index-v2-Linux`. Якщо довідник застарів або сайт змінив адресу/вулиці, видаліть цей кеш у Settings → Actions → Caches; наступний запуск завантажить довідник заново. Також можна змінити `v1` на `v2` у ключі cache в `.github/workflows/check-schedule.yml` і відправити commit.
-- API сайту може змінитися, бути недоступним або блокувати автоматичні запити.
-- GitHub Actions має обмеження планувальника, а workflow у публічному репозиторії може автоматично вимкнутися після 60 днів без активності репозиторію.
-- При збоях сайт/Telegram не трактуються як «змін немає»: останній коректний графік зберігається, після трьох невдалих перевірок користувач отримує попередження.
-- Ресурси безкоштовного GitHub-хостингу та швидкість API обмежені; це не обіцянка необмеженої кількості підписок.
-
-Детальна інструкція міграції з попереднього однокористувацького бота: `DEPLOY_MIGRATION.md`.
+Telegram button/text updates are delivered to the Worker using a webhook, normally within seconds, subject to Telegram/network/Cloudflare latency. No free provider can guarantee a hard maximum of 5 seconds. Schedule refresh is started by GitHub Actions every 10 minutes; scheduled runs can be delayed. User subscriptions live in D1, not in the public Git repository.

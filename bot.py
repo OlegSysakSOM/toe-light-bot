@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import html
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -40,30 +41,28 @@ BTN_CANCEL = "❌ Скасувати"
 
 
 def _reply_keyboard(user: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Always show the full menu, even while the user is entering an address.
+
+    The previous version hid every menu action except Cancel/Help whenever a
+    conversation flow was active. That looked like the bot only had two buttons
+    and made it hard to recover from a stale address-entry state.
+    """
     user = user or {}
-    rows: list[list[dict[str, str]]] = []
-    if user.get("flow"):
-        rows.append([{"text": BTN_CANCEL}])
-        rows.append([{"text": BTN_HELP}])
-    else:
-        if user.get("address_key"):
-            rows.append([{"text": BTN_CHANGE}, {"text": BTN_STATUS}])
-            rows.append([{"text": BTN_STOP if user.get("active") else BTN_RESUME}])
-        else:
-            rows.append([{"text": BTN_ADD}])
-        rows.append([{"text": BTN_HELP}])
-    placeholders = {
-        "city": "Введіть населений пункт",
-        "street": "Введіть назву вулиці",
-        "building": "Введіть номер будинку",
-        "choose": "Оберіть варіант кнопкою",
-    }
-    placeholder = placeholders.get(user.get("flow"), "Оберіть дію")
+    notification_button = BTN_STOP if user.get("active") else BTN_RESUME
     return {
-        "keyboard": rows,
+        "keyboard": [
+            [{"text": BTN_ADD}, {"text": BTN_CHANGE}],
+            [{"text": BTN_STATUS}, {"text": notification_button}],
+            [{"text": BTN_CANCEL}, {"text": BTN_HELP}],
+        ],
         "resize_keyboard": True,
         "is_persistent": True,
-        "input_field_placeholder": placeholder,
+        "input_field_placeholder": (
+            "Введіть населений пункт" if user.get("flow") == "city" else
+            "Введіть назву вулиці" if user.get("flow") == "street" else
+            "Введіть номер будинку" if user.get("flow") == "building" else
+            "Оберіть дію в меню"
+        ),
     }
 
 
@@ -156,7 +155,7 @@ def _activate_subscription(chat_id: str, user: dict[str, Any], candidate: dict[s
         f"📍 {_safe_text(candidate['label'])}\n"
         f"🔢 Черга: <b>{_safe_text(candidate['group'])}</b>\n\n"
         "Найближчим циклом надішлю актуальне зображення графіка. "
-        "Надалі графік перевірятиметься приблизно кожні 15 хвилин.",
+        "Надалі графік перевірятиметься приблизно кожні 10 хвилин.",
         user=user,
     )
 
@@ -190,7 +189,7 @@ def _handle_text(chat_id: str, text: str, state: dict[str, Any], tg: Telegram,
         _begin_address_flow(chat_id, user, tg, change=False)
         return
     if value == BTN_CHANGE:
-        _begin_address_flow(chat_id, user, tg, change=True)
+        _begin_address_flow(chat_id, user, tg, change=bool(user.get("address_key")))
         return
     if value == BTN_STATUS:
         value = "/status"
@@ -575,6 +574,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Public multi-user TOE outage schedule bot")
     parser.add_argument("--once", action="store_true", help="one processing cycle (default)")
     args = parser.parse_args()
+    if os.environ.get("ENABLE_LEGACY_GETUPDATES", "0").strip() != "1":
+        raise SystemExit(
+            "Старий режим getUpdates вимкнено у production. "
+            "Для перевірки графіків використовуйте python schedule_job.py; "
+            "Telegram-кнопки обробляє Cloudflare Worker webhook."
+        )
 
     cfg = load_config()
     setup_logging(cfg.log_level)
@@ -585,12 +590,11 @@ def main() -> None:
     http = requests.Session()
     http.headers.update({"User-Agent": "TOE-Outage-Bot/2.0"})
 
-    # getUpdates and webhook mode are mutually exclusive. Keep queued updates.
-    tg.delete_webhook()
+    # Legacy polling is opt-in only. In production the Worker owns the webhook.
     process_updates(tg, state, cfg, store, http)
 
     now_ts = time.time()
-    interval = int(getattr(cfg, "schedule_check_interval_seconds", 900))
+    interval = int(getattr(cfg, "schedule_check_interval_seconds", 600))
     forced = bool(state.get("force_schedule_check", False))
     has_active_users = any(
         user.get("active") and user.get("address_key") and user.get("group")

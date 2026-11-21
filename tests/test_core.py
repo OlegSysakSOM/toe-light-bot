@@ -212,7 +212,10 @@ def test_menu_buttons_start_and_change_address_without_slash_commands(monkeypatc
     bot_module._handle_text(chat, bot_module.BTN_ADD, state, tg, cfg, http)
     user = state["users"][chat]
     assert user["flow"] == "city"
-    assert tg.messages[-1]["reply_markup"]["keyboard"][0][0]["text"] == bot_module.BTN_CANCEL
+    opening_buttons = [button["text"] for row in tg.messages[-1]["reply_markup"]["keyboard"] for button in row]
+    assert bot_module.BTN_CANCEL in opening_buttons
+    assert bot_module.BTN_ADD in opening_buttons
+    assert bot_module.BTN_CHANGE in opening_buttons
 
     for value in ("Велика Лука", "Івана Франка", "24"):
         bot_module._handle_text(chat, value, state, tg, cfg, http)
@@ -291,13 +294,16 @@ def test_state_store_does_not_reencrypt_unchanged_data(tmp_path: Path):
     assert first_payload == second_payload
 
 
-def test_button_keyboard_has_cancel_during_address_entry_and_menu_afterwards():
+def test_button_keyboard_always_shows_full_menu_even_during_address_entry():
     import bot as bot_module
 
     keyboard_flow = bot_module._reply_keyboard({"flow": "street", "address_key": ""})
     flow_texts = [button["text"] for row in keyboard_flow["keyboard"] for button in row]
     assert bot_module.BTN_CANCEL in flow_texts
-    assert bot_module.BTN_ADD not in flow_texts
+    assert bot_module.BTN_HELP in flow_texts
+    assert bot_module.BTN_ADD in flow_texts
+    assert bot_module.BTN_CHANGE in flow_texts
+    assert bot_module.BTN_STATUS in flow_texts
 
     keyboard_active = bot_module._reply_keyboard({"flow": None, "address_key": "22016/40637/24", "active": True})
     active_texts = [button["text"] for row in keyboard_active["keyboard"] for button in row]
