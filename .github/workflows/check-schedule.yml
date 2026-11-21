@@ -2,7 +2,7 @@ name: TOE public bot — users and outage schedules
 
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +15,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - name: Checkout repository and encrypted state
         uses: actions/checkout@v4
@@ -31,12 +31,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/toe_address_index.json
-          key: toe-address-index-v1-${{ runner.os }}
+          key: toe-address-index-v2-${{ runner.os }}
 
       - name: Install dependencies
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Process Telegram users and refresh schedules
+      - name: Process Telegram inbox and refresh schedules when due
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           STATE_ENCRYPTION_KEY: ${{ secrets.STATE_ENCRYPTION_KEY }}
@@ -44,6 +44,7 @@ jobs:
           ADDRESS_INDEX_FILE: .cache/toe_address_index.json
           TIMEZONE: Europe/Kyiv
           MAX_ADDRESS_PAGES: "600"
+          SCHEDULE_CHECK_INTERVAL_SECONDS: "900"
           LOG_LEVEL: INFO
         run: python bot.py --once
 

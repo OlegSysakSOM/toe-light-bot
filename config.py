@@ -29,6 +29,7 @@ class Config:
     address_index_file: Path
     timezone: str = "Europe/Kyiv"
     max_address_pages: int = 600
+    schedule_check_interval_seconds: int = 900
     log_level: str = "INFO"
 
 
@@ -48,5 +49,6 @@ def load_config() -> Config:
         address_index_file=BASE_DIR / env("ADDRESS_INDEX_FILE", ".cache/toe_address_index.json"),
         timezone=env("TIMEZONE", "Europe/Kyiv").strip(),
         max_address_pages=max(1, int(env("MAX_ADDRESS_PAGES", "600"))),
+        schedule_check_interval_seconds=max(300, int(env("SCHEDULE_CHECK_INTERVAL_SECONDS", "900"))),
         log_level=env("LOG_LEVEL", "INFO").upper(),
     )

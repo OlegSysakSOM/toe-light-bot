@@ -67,18 +67,28 @@ class Telegram:
             "offset": offset,
             "limit": max(1, min(100, limit)),
             "timeout": 0,
-            "allowed_updates": json.dumps(["message"]),
+            "allowed_updates": json.dumps(["message", "callback_query"]),
         }, timeout=30)
         return result or []
 
-    def send_message(self, chat_id: str, text: str) -> int:
-        result = self._call("sendMessage", data={
+    def send_message(self, chat_id: str, text: str,
+                     reply_markup: dict[str, Any] | None = None) -> int:
+        data: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": "true",
-        })
+        }
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        result = self._call("sendMessage", data=data)
         return int(result["message_id"])
+
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        data: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            data["text"] = text[:200]
+        self._call("answerCallbackQuery", data=data)
 
     def send_photo(self, chat_id: str, png: bytes, caption: str) -> int:
         result = self._call("sendPhoto", data={
