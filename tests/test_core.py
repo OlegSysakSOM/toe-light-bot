@@ -401,25 +401,24 @@ def test_state_store_reload_does_not_create_artificial_commit(tmp_path: Path):
     assert path.read_bytes() == original_bytes
 
 
-def test_refresh_edits_existing_schedule_when_same_and_sends_new_when_changed(monkeypatch):
+def test_background_refresh_sends_only_on_real_schedule_change(monkeypatch):
     from datetime import datetime
     from types import SimpleNamespace
-    from zoneinfo import ZoneInfo
     import bot as bot_module
 
     class FakeTelegram:
         def __init__(self):
-            self.edits = []
             self.photos = []
+            self.edits = []
             self.messages = []
-        def edit_photo(self, chat_id, message_id, png, caption):
-            self.edits.append((chat_id, message_id, png, caption))
         def send_photo(self, chat_id, png, caption):
             self.photos.append((chat_id, png, caption))
             return 99
-        def send_message(self, chat_id, text, reply_markup=None):
-            self.messages.append((chat_id, text, reply_markup))
-            return len(self.messages)
+        def edit_photo(self, *args):
+            self.edits.append(args)
+            raise AssertionError("Automatic refresh must never edit old messages")
+        def send_message(self, *args, **kwargs):
+            self.messages.append(args)
 
     class FakeStore:
         def save(self, state):
@@ -427,35 +426,77 @@ def test_refresh_edits_existing_schedule_when_same_and_sends_new_when_changed(mo
 
     tz = ZoneInfo("Europe/Kyiv")
     day = datetime.now(tz).date().isoformat()
-    old_slots = "0" * 48
-    same_schedule = {day: {"slots": old_slots, "created": "old"}}
-    changed_schedule = {day: {"slots": "1" + old_slots[1:], "created": "new"}}
+    same = {day: {"slots": "0" * 48, "created": "same"}}
+    changed = {day: {"slots": "1" + "0" * 47, "created": "different"}}
     monkeypatch.setattr(bot_module, "render_schedule_png", lambda *a, **k: b"png")
-
-    state = {"users": {
-        "555": {
-            "active": True,
-            "address_key": "22016/40637/24",
-            "group": "5.1",
-            "address_label": "Велика Лука · Франка · 24",
-            "snapshot": {day: old_slots},
-            "message_id": 77,
-            "fail_count": 0,
-            "error_notified": False,
-        }
-    }}
+    state = {"users": {"555": {
+        "active": True, "address_key": "22016/40637/24", "group": "5.1",
+        "address_label": "Велика Лука · Франка · 24",
+        "snapshot": {day: "0" * 48}, "message_id": 77,
+        "fail_count": 0, "error_notified": False,
+    }}}
     tg = FakeTelegram()
-    cfg = SimpleNamespace()
 
-    monkeypatch.setattr(bot_module, "fetch_schedule", lambda *a, **k: same_schedule)
-    bot_module.process_subscriptions(tg, state, cfg, tz, object(), FakeStore())
-    assert len(tg.edits) == 1
-    assert tg.edits[0][1] == 77
-    assert "Змін немає" in tg.edits[0][3]
+    monkeypatch.setattr(bot_module, "fetch_schedule", lambda *a, **k: same)
+    stats = bot_module.process_subscriptions(tg, state, SimpleNamespace(), tz, object(), FakeStore())
+    assert stats["unchanged"] == 1
     assert tg.photos == []
+    assert tg.edits == []
+    assert tg.messages == []
 
-    monkeypatch.setattr(bot_module, "fetch_schedule", lambda *a, **k: changed_schedule)
-    bot_module.process_subscriptions(tg, state, cfg, tz, object(), FakeStore())
+    monkeypatch.setattr(bot_module, "fetch_schedule", lambda *a, **k: changed)
+    stats = bot_module.process_subscriptions(tg, state, SimpleNamespace(), tz, object(), FakeStore())
+    assert stats["sent"] == 1
     assert len(tg.photos) == 1
+    assert tg.edits == []
     assert state["users"]["555"]["message_id"] == 99
-    assert "ГРАФІК ЗМІНИВСЯ" in tg.photos[0][2]
+    assert state["users"]["555"]["snapshot"][day] == changed[day]["slots"]
+
+
+def test_background_refresh_establishes_first_snapshot_silently(monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+    import bot as bot_module
+
+    class FakeTelegram:
+        def send_photo(self, *args):
+            raise AssertionError("Initial baseline must not send a notification")
+        def edit_photo(self, *args):
+            raise AssertionError("Initial baseline must not edit a message")
+        def send_message(self, *args, **kwargs):
+            raise AssertionError("Initial baseline must be silent")
+
+    class FakeStore:
+        def save(self, state):
+            pass
+
+    tz = ZoneInfo("Europe/Kyiv")
+    day = datetime.now(tz).date().isoformat()
+    schedule = {day: {"slots": "0" * 48, "created": "now"}}
+    monkeypatch.setattr(bot_module, "fetch_schedule", lambda *a, **k: schedule)
+    state = {"users": {"555": {
+        "active": True, "address_key": "22016/40637/24", "group": "5.1",
+        "address_label": "Велика Лука · Франка · 24", "snapshot": {},
+    }}}
+    stats = bot_module.process_subscriptions(FakeTelegram(), state, SimpleNamespace(), tz, object(), FakeStore())
+    assert stats["baselined"] == 1
+    assert state["users"]["555"]["snapshot"][day] == "0" * 48
+
+
+def test_reference_png_is_600px_wide():
+    from datetime import datetime
+    from io import BytesIO
+    from PIL import Image
+    from render import render_schedule_png
+
+    tz = ZoneInfo("Europe/Kyiv")
+    now = datetime.now(tz)
+    day = now.date().isoformat()
+    slots = "0" * 16 + "1" * 8 + "2" * 4 + "0" * 20
+    png = render_schedule_png(
+        {day: {"slots": slots, "created": "test"}},
+        "Велика Лука · вул. Івана Франка, 24", "5.1", now,
+    )
+    with Image.open(BytesIO(png)) as image:
+        assert image.width == 600
+        assert image.height > 500
