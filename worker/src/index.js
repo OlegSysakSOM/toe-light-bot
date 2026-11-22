@@ -109,7 +109,7 @@ async function sendPhoto(env, chatId, pngBytes, caption, user) {
 async function sendCachedSchedule(env, user, chatId) {
   if (!env.DB || !user.address_key || !user.group_name) return false;
   const row = await env.DB.prepare(
-    'SELECT latest_png, latest_cached_at, latest_cached_at_ms FROM schedule_images WHERE cache_key = ?'
+    'SELECT latest_png, latest_snapshot, latest_cached_at, latest_cached_at_ms FROM schedule_images WHERE cache_key = ?'
   ).bind(scheduleCacheKey(user.address_key, user.group_name)).first();
   if (!row) return false;
   const png = toUint8Array(row.latest_png);
@@ -130,6 +130,12 @@ async function sendCachedSchedule(env, user, chatId) {
     '🕒 Оновлено: <b>' + escapeHtml(cachedAt) + '</b> (Київ)\n\n' +
     '📲 Актуальний графік із кешу.\nДжерело: poweron.toe.com.ua';
   await sendPhoto(env, chatId, png, caption, user);
+  if (row.latest_snapshot) {
+    await env.DB.prepare(
+      "UPDATE users SET snapshot = ?, last_ok = ?, fail_count = 0, error_notified = 0, " +
+      "no_schedule_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?"
+    ).bind(String(row.latest_snapshot), cachedAt, String(chatId)).run();
+  }
   return true;
 }
 async function dispatchScheduledRefresh(env) {
@@ -449,9 +455,13 @@ export default {
     if (request.method === "GET" && url.pathname === "/health") {
       const row = await env.DB.prepare("SELECT COUNT(*) AS users FROM users").first();
       const idx = await env.DB.prepare("SELECT COUNT(*) AS records FROM address_index").first();
+      const cacheTable = await env.DB.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schedule_images'"
+      ).first();
       return Response.json({
         ok: true, users: row?.users || 0, address_records: idx?.records || 0,
-        cache_enabled: Boolean(env.DB), cache_backend: "d1_blob", cron_enabled: true, version: "2.6.0",
+        cache_enabled: Boolean(cacheTable), cache_backend: "d1_blob",
+        cron_enabled: true, version: "2.6.0",
       });
     }
     if (request.method === "POST" && url.pathname === "/internal/cache-schedule") {
