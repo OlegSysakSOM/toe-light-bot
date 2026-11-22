@@ -72,8 +72,9 @@ const ON_DEMAND_WORKFLOW = "on-demand-schedule.yml";
 const REFRESH_WORKFLOW = "check-schedule.yml";
 const CACHE_MAX_AGE_MS = 15 * 60 * 1000;
 
-function scheduleCacheKey(addressKey, group) {
-  return `schedules/${encodeURIComponent(`${addressKey}|${group}`)}.png`;
+function scheduleCacheKey(addressKey, group, slot = "latest") {
+  if (!["latest", "previous"].includes(slot)) throw new Error("Invalid schedule cache slot");
+  return `schedules/${encodeURIComponent(`${addressKey}|${group}`)}.${slot}.png`;
 }
 
 async function sendPhoto(env, chatId, object, caption, user) {
@@ -96,7 +97,8 @@ async function sendPhoto(env, chatId, object, caption, user) {
 
 async function sendCachedSchedule(env, user, chatId) {
   if (!env.SCHEDULE_CACHE || !user.address_key || !user.group_name) return false;
-  const object = await env.SCHEDULE_CACHE.get(scheduleCacheKey(user.address_key, user.group_name));
+  let object = await env.SCHEDULE_CACHE.get(scheduleCacheKey(user.address_key, user.group_name, "latest"));
+  if (!object) object = await env.SCHEDULE_CACHE.get(scheduleCacheKey(user.address_key, user.group_name, "previous"));
   if (!object) return false;
   const cachedAtMs = Number(object.customMetadata?.cached_at_ms || 0);
   const age = Date.now() - cachedAtMs;
@@ -455,8 +457,17 @@ export default {
         if (binary.length < 8 || !pngSignature.every((value, index) => binary[index] === value)) {
           return Response.json({ ok: false, error: "Uploaded file is not a PNG" }, { status: 400 });
         }
+        const latestKey = scheduleCacheKey(addressKey, groupName, "latest");
+        const previousKey = scheduleCacheKey(addressKey, groupName, "previous");
+        const priorLatest = await env.SCHEDULE_CACHE.get(latestKey);
+        if (priorLatest) {
+          await env.SCHEDULE_CACHE.put(previousKey, await priorLatest.arrayBuffer(), {
+            httpMetadata: priorLatest.httpMetadata,
+            customMetadata: priorLatest.customMetadata,
+          });
+        }
         const snapshot = JSON.stringify(body.snapshot || {});
-        await env.SCHEDULE_CACHE.put(scheduleCacheKey(addressKey, groupName), binary, {
+        await env.SCHEDULE_CACHE.put(latestKey, binary, {
           httpMetadata: { contentType: "image/png" },
           customMetadata: {
             address_label: String(body.address_label || "").slice(0, 500),
