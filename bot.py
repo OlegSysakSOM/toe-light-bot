@@ -485,7 +485,7 @@ def _caption(user: dict[str, Any], checked_at: datetime, status: str) -> str:
 
 def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
                           tz: ZoneInfo, http: requests.Session, store: StateStore,
-                          image_cache: Callable[[str, str, bytes, datetime], None] | None = None) -> dict[str, int]:
+                          image_cache: Callable[[str, str, bytes, datetime, str, dict[str, str]], None] | None = None) -> dict[str, int]:
     """Send a new PNG only when the actual outage slots change."""
     users = state.setdefault("users", {})
     active = [(chat_id, user) for chat_id, user in users.items()
@@ -530,7 +530,7 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
             cached_identities.add(identity)
             try:
                 cached_png = render_schedule_png(result, user["address_label"], user["group"], now)
-                image_cache(user["address_key"], user["group"], cached_png, now)
+                image_cache(user["address_key"], user["group"], cached_png, now, user["address_label"], snapshot)
                 log.info("PNG-кеш оновлено: %s", identity)
             except Exception:
                 cached_png = None
