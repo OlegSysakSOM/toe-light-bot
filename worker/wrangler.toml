@@ -7,5 +7,12 @@ binding = "DB"
 database_name = "toe-public-bot-db"
 database_id = "ed3f982f-6a73-4dfa-a57b-a03fdd1162f3"
 
+[[r2_buckets]]
+binding = "SCHEDULE_CACHE"
+bucket_name = "toe-public-schedule-cache"
+
+[triggers]
+crons = ["*/10 * * * *"]
+
 [observability]
 enabled = true
