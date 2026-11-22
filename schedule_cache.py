@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 from datetime import datetime
+from typing import Any
 
 import requests
 
@@ -28,21 +29,33 @@ class ScheduleCacheUploader:
             return None
         return cls(worker_url, secret)
 
-    def put(self, address_key: str, group: str, png: bytes, checked_at: datetime) -> None:
-        if not address_key or not group or not png.startswith(b"\\x89PNG\\r\\n\\x1a\\n"):
+    def put(
+        self,
+        address_key: str,
+        group: str,
+        png: bytes,
+        checked_at: datetime,
+        address_label: str,
+        snapshot: dict[str, str],
+    ) -> None:
+        if not address_key or not group or not png.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError("Некоректні дані для кешу графіка.")
+        payload: dict[str, Any] = {
+            "address_key": address_key,
+            "group_name": group,
+            "address_label": address_label,
+            "png_base64": base64.b64encode(png).decode("ascii"),
+            "cached_at": checked_at.strftime("%d.%m.%Y %H:%M"),
+            "cached_at_ms": int(checked_at.timestamp() * 1000),
+            "snapshot": snapshot,
+        }
         response = self.session.post(
             self.url,
             headers={"Authorization": f"Bearer {self.secret}"},
-            json={
-                "address_key": address_key,
-                "group_name": group,
-                "png_base64": base64.b64encode(png).decode("ascii"),
-                "cached_at": checked_at.strftime("%d.%m.%Y %H:%M"),
-            },
+            json=payload,
             timeout=(5, 25),
         )
         response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
+        result = response.json()
+        if not result.get("ok"):
             raise RuntimeError("Worker не підтвердив збереження PNG у R2.")
