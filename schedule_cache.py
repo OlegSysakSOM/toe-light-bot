@@ -46,15 +46,21 @@ class ScheduleCacheUploader:
             "address_key": address_key,
             "group_name": group,
             "address_label": address_label,
-            "png_base64": base64.b64encode(png).decode("ascii"),
             "cached_at": checked_at.strftime("%d.%m.%Y %H:%M"),
             "cached_at_ms": int(checked_at.timestamp() * 1000),
             "snapshot": snapshot,
         }
+        metadata = base64.b64encode(
+            __import__("json").dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
         response = self.session.post(
             self.url,
-            headers={"Authorization": f"Bearer {self.secret}"},
-            json=payload,
+            headers={
+                "Authorization": f"Bearer {self.secret}",
+                "Content-Type": "image/png",
+                "X-Schedule-Meta": metadata,
+            },
+            data=png,
             timeout=(5, 25),
         )
         response.raise_for_status()
