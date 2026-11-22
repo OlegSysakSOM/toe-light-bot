@@ -1,0 +1,28 @@
+name: Validate TOE bot changes
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Python syntax
+        run: python -m compileall -q bot.py schedule_job.py on_demand_schedule.py schedule_cache.py cloudflare_d1.py render.py toe_api.py
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check Cloudflare Worker syntax
+        run: node --check worker/src/index.js

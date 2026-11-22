@@ -13,6 +13,7 @@ import requests
 from bot import process_subscriptions
 from cloudflare_d1 import D1Client
 from telegram_api import Telegram
+from schedule_cache import ScheduleCacheUploader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("schedule_job")
@@ -75,7 +76,9 @@ def main() -> None:
     http = requests.Session()
     http.headers.update({"User-Agent": "TOE-Public-Outage-Bot/2.2"})
     cfg = SimpleNamespace(timezone=str(tz), schedule_check_interval_seconds=600)
-    stats = process_subscriptions(tg, state, cfg, tz, http, NoopStore())
+    image_cache = ScheduleCacheUploader.from_env()
+    stats = process_subscriptions(tg, state, cfg, tz, http, NoopStore(),
+                                  image_cache=image_cache.put if image_cache else None)
 
     updates = []
     for chat_id, user in users.items():

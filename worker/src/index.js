@@ -69,6 +69,76 @@ async function answerCallback(env, id, text = "") {
 
 const GITHUB_REPOSITORY = "OlegSysakSOM/toe-light-bot";
 const ON_DEMAND_WORKFLOW = "on-demand-schedule.yml";
+const REFRESH_WORKFLOW = "check-schedule.yml";
+const CACHE_MAX_AGE_MS = 15 * 60 * 1000;
+
+function scheduleCacheKey(addressKey, group, slot = "latest") {
+  if (!["latest", "previous"].includes(slot)) throw new Error("Invalid schedule cache slot");
+  return `schedules/${encodeURIComponent(`${addressKey}|${group}`)}.${slot}.png`;
+}
+
+async function sendPhoto(env, chatId, object, caption, user) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("caption", caption);
+  form.append("parse_mode", "HTML");
+  form.append("reply_markup", JSON.stringify(mainKeyboard(user)));
+  form.append("photo", new Blob([await object.arrayBuffer()], { type: "image/png" }), "schedule.png");
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    body: form,
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.ok) {
+    throw new Error(`Telegram sendPhoto: ${payload.description || response.status}`);
+  }
+  return payload.result;
+}
+
+async function sendCachedSchedule(env, user, chatId) {
+  if (!env.SCHEDULE_CACHE || !user.address_key || !user.group_name) return false;
+  let object = await env.SCHEDULE_CACHE.get(scheduleCacheKey(user.address_key, user.group_name, "latest"));
+  if (!object) object = await env.SCHEDULE_CACHE.get(scheduleCacheKey(user.address_key, user.group_name, "previous"));
+  if (!object) return false;
+  const cachedAtMs = Number(object.customMetadata?.cached_at_ms || 0);
+  const age = Date.now() - cachedAtMs;
+  if (!Number.isFinite(cachedAtMs) || cachedAtMs <= 0 || age < -2 * 60 * 1000 || age > CACHE_MAX_AGE_MS) {
+    return false;
+  }
+  const cachedAt = object.customMetadata?.cached_at || "нещодавно";
+  const caption =
+    `⚡ <b>ГРАФІК ВІДКЛЮЧЕНЬ</b>\n` +
+    `📍 ${escapeHtml(user.address_label)}\n` +
+    `🔢 Черга: <b>${escapeHtml(user.group_name)}</b>\n` +
+    `🕒 Оновлено: <b>${escapeHtml(cachedAt)}</b> (Київ)\n\n` +
+    `📲 Актуальний графік із кешу.\nДжерело: poweron.toe.com.ua`;
+  await sendPhoto(env, chatId, object, caption, user);
+  return true;
+}
+
+async function dispatchScheduledRefresh(env) {
+  const token = String(env.GITHUB_ACTIONS_TOKEN || "").trim();
+  if (!token) throw new Error("Не налаштовано GITHUB_ACTIONS_TOKEN у Cloudflare Worker.");
+  const response = await fetch(
+    `https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${REFRESH_WORKFLOW}/dispatches`,
+    {
+      method: "POST",
+      headers: {
+        "Accept": "application/vnd.github+json",
+        "Authorization": `Bearer ${token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+        "User-Agent": "TOE-Public-Outage-Bot",
+      },
+      body: JSON.stringify({ ref: "main" }),
+      signal: AbortSignal.timeout(12000),
+    },
+  );
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 300);
+    throw new Error(`GitHub schedule workflow dispatch failed (HTTP ${response.status}): ${detail}`);
+  }
+}
 
 async function dispatchFreshPng(env, chatId) {
   const token = String(env.GITHUB_ACTIONS_TOKEN || "").trim();
@@ -95,6 +165,11 @@ async function dispatchFreshPng(env, chatId) {
 }
 
 async function queueFreshPng(env, user, chatId, ctx) {
+  try {
+    if (await sendCachedSchedule(env, user, chatId)) return;
+  } catch (error) {
+    console.error("Cached PNG delivery failed; using on-demand fallback", error);
+  }
   await sendMessage(env, chatId, "📸 Готую свіжий графік-картинку з даних Тернопільобленерго…", user);
   ctx?.waitUntil?.(
     dispatchFreshPng(env, chatId).catch(async (error) => {
@@ -348,12 +423,65 @@ function authorized(request, env) {
 }
 
 export default {
+  async scheduled(controller, env) {
+    await dispatchScheduledRefresh(env);
+    console.log("Cloudflare Cron dispatched schedule refresh", controller.cron, new Date(controller.scheduledTime).toISOString());
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       const row = await env.DB.prepare("SELECT COUNT(*) AS users FROM users").first();
       const idx = await env.DB.prepare("SELECT COUNT(*) AS records FROM address_index").first();
-      return Response.json({ ok: true, users: row?.users || 0, address_records: idx?.records || 0, version: "2.4.0" });
+      return Response.json({
+        ok: true, users: row?.users || 0, address_records: idx?.records || 0,
+        cache_enabled: Boolean(env.SCHEDULE_CACHE), cron_enabled: true, version: "2.5.0",
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/internal/cache-schedule") {
+      const supplied = request.headers.get("authorization") || "";
+      if (!env.CACHE_UPLOAD_SECRET || supplied !== `Bearer ${env.CACHE_UPLOAD_SECRET}`) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      if (!env.SCHEDULE_CACHE) return Response.json({ ok: false, error: "R2 binding is missing" }, { status: 503 });
+      try {
+        const body = await request.json();
+        const addressKey = String(body.address_key || "").trim();
+        const groupName = String(body.group_name || "").trim();
+        const base64 = String(body.png_base64 || "");
+        if (!addressKey || !groupName || !base64 || base64.length > 4 * 1024 * 1024) {
+          return Response.json({ ok: false, error: "Invalid cache payload" }, { status: 400 });
+        }
+        const binary = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+        const pngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+        if (binary.length < 8 || !pngSignature.every((value, index) => binary[index] === value)) {
+          return Response.json({ ok: false, error: "Uploaded file is not a PNG" }, { status: 400 });
+        }
+        const latestKey = scheduleCacheKey(addressKey, groupName, "latest");
+        const previousKey = scheduleCacheKey(addressKey, groupName, "previous");
+        const priorLatest = await env.SCHEDULE_CACHE.get(latestKey);
+        if (priorLatest) {
+          await env.SCHEDULE_CACHE.put(previousKey, await priorLatest.arrayBuffer(), {
+            httpMetadata: priorLatest.httpMetadata,
+            customMetadata: priorLatest.customMetadata,
+          });
+        }
+        const snapshot = JSON.stringify(body.snapshot || {});
+        await env.SCHEDULE_CACHE.put(latestKey, binary, {
+          httpMetadata: { contentType: "image/png" },
+          customMetadata: {
+            address_label: String(body.address_label || "").slice(0, 500),
+            group_name: groupName.slice(0, 80),
+            cached_at: String(body.cached_at || "").slice(0, 32),
+            cached_at_ms: String(Number(body.cached_at_ms) || Date.now()),
+            snapshot: snapshot.slice(0, 2000),
+          },
+        });
+        return Response.json({ ok: true });
+      } catch (error) {
+        console.error("Schedule cache upload failed", error);
+        return Response.json({ ok: false, error: String(error?.message || error) }, { status: 400 });
+      }
     }
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) {
