@@ -1,6 +1,6 @@
 # Cloudflare Worker — Telegram webhook
 
-This Worker handles Telegram messages/buttons immediately. Cloudflare Cron triggers the existing Python/GitHub Actions refresh workflow every 10 minutes. The latest rendered PNG is cached in a private R2 bucket so «📊 Мій графік» can return it without waiting for a new GitHub runner.
+This Worker handles Telegram messages/buttons immediately. Cloudflare Cron triggers the existing Python/GitHub Actions refresh workflow every 10 minutes. The latest rendered PNG and its predecessor are kept in a private R2 bucket (two objects per address/queue, overwritten on each refresh) so «📊 Мій графік» can return the current image without waiting for a new GitHub runner.
 
 ## Create D1 and deploy
 
