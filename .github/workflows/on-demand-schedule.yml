@@ -32,6 +32,8 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          CACHE_UPLOAD_SECRET: ${{ secrets.CACHE_UPLOAD_SECRET }}
           TIMEZONE: Europe/Kyiv
           CHAT_ID: ${{ inputs.chat_id }}
         run: python on_demand_schedule.py
