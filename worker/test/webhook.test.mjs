@@ -86,7 +86,18 @@ test("cache upload stores PNG bytes in D1 and rotates the previous image", async
   });
   const request = new Request("https://example.workers.dev/internal/cache-schedule", {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer cache-secret" },
+    headers: {
+      "content-type": "image/png",
+      authorization: "Bearer cache-secret",
+      "x-schedule-meta": Buffer.from(JSON.stringify({
+        address_key: "22016/40637/24",
+        group_name: "5.1",
+        address_label: "Велика Лука · Франка · 24",
+        cached_at: "22.11.2026 12:10",
+        cached_at_ms: Date.now(),
+        snapshot: { "2026-11-22": "100" },
+      })).toString("base64"),
+    },
     body: PNG,
   });
   const response = await worker.fetch(request, { DB: db, CACHE_UPLOAD_SECRET: "cache-secret" });
