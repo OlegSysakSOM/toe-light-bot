@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import requests
@@ -484,7 +484,8 @@ def _caption(user: dict[str, Any], checked_at: datetime, status: str) -> str:
 
 
 def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
-                          tz: ZoneInfo, http: requests.Session, store: StateStore) -> dict[str, int]:
+                          tz: ZoneInfo, http: requests.Session, store: StateStore,
+                          image_cache: Callable[[str, str, bytes, datetime], None] | None = None) -> dict[str, int]:
     """Send a new PNG only when the actual outage slots change."""
     users = state.setdefault("users", {})
     active = [(chat_id, user) for chat_id, user in users.items()
@@ -497,6 +498,7 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
 
     now = datetime.now(tz)
     cache: dict[str, dict[str, dict[str, str]] | Exception] = {}
+    cached_identities: set[str] = set()
     for chat_id, user in active:
         identity = f"{user['address_key']}|{user['group']}"
         if identity not in cache:
@@ -520,6 +522,20 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
         snapshot = {day: item["slots"] for day, item in sorted(result.items())}
         previous = user.get("snapshot") or {}
 
+        # Refresh the shared R2 image cache on every successful check, even when the
+        # schedule has not changed. This lets the Telegram button return the latest
+        # rendered PNG immediately without waiting for a new GitHub runner.
+        cached_png: bytes | None = None
+        if image_cache is not None and identity not in cached_identities:
+            cached_identities.add(identity)
+            try:
+                cached_png = render_schedule_png(result, user["address_label"], user["group"], now)
+                image_cache(user["address_key"], user["group"], cached_png, now)
+                log.info("PNG-кеш оновлено: %s", identity)
+            except Exception:
+                cached_png = None
+                log.exception("Не вдалося оновити PNG-кеш: %s", identity)
+
         # First successful fetch is a silent baseline: the first picture is requested by the user.
         if not previous:
             user["snapshot"] = snapshot
@@ -538,7 +554,7 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
 
         stats["changed"] += 1
         caption = _caption(user, now, "🔔 <b>ГРАФІК ЗМІНИВСЯ!</b> Надсилаю нове зображення.")
-        png = render_schedule_png(result, user["address_label"], user["group"], now)
+        png = cached_png or render_schedule_png(result, user["address_label"], user["group"], now)
         try:
             # Do not edit previous messages. A real change always makes a new photo message.
             message_id = send_schedule_change_photo(tg, chat_id, png, caption)
