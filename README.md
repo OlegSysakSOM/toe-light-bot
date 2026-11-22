@@ -1,28 +1,22 @@
-# TOE Public Bot 2.4.0 — live PNG on button, changed-only background alerts
+# TOE Public Bot 2.6.0 — Cloudflare Cron + D1 PNG cache (no R2)
 
 ## How it works
-- **📊 Мій графік** requests a fresh schedule from the TOE API and sends a PNG image using the mobile-first design based on the supplied reference.
-- Every 10 minutes, GitHub Actions checks the active subscriptions in the background.
-- The background process compares the complete dates and all 48 half-hour slots.
-- If nothing changed, the bot sends nothing and does not edit any previous message.
-- If the schedule really changed, the bot sends one new PNG photo.
-- The first successful background check creates a silent baseline. To see the first image, press **📊 Мій графік**.
-- A manual image request also updates the comparison baseline, preventing a duplicate automatic alert for the same data.
+- Cloudflare Cron dispatches the existing Python/GitHub Actions refresh at minute **00, 10, 20, 30, 40, 50** every hour.
+- Python fetches TOE schedules, compares all 48 half-hour slots, renders the original PNG design, and sends a new photo only when the schedule really changes.
+- Every successful refresh uploads the latest rendered PNG to the existing Cloudflare D1 database as a BLOB.
+- D1 keeps exactly two image versions per unique address/queue: `latest_png` and `previous_png`. The older image is overwritten each refresh.
+- «📊 Мій графік» sends the most recent cached PNG directly from D1. If the cache is missing or older than 15 minutes, the existing on-demand workflow remains as fallback.
+- No change = no automatic message. Old Telegram messages are never edited.
+
+## No R2
+This release does not use R2, does not need an R2 bucket, and has no R2 binding. The PNG cache uses the existing D1 database.
 
 ## Deployment
-Read **DEPLOY_2.4.md** for the Worker token and redeployment steps.
+Follow [SETUP_CF_CRON_D1_CACHE.md](SETUP_CF_CRON_D1_CACHE.md). The migration is additive: it adds only the `schedule_images` table and preserves existing users and addresses.
 
-GitHub Actions secrets:
-- `TELEGRAM_BOT_TOKEN`
-- `CLOUDFLARE_API_TOKEN`
-- `CLOUDFLARE_ACCOUNT_ID`
-- `CLOUDFLARE_D1_DATABASE_ID`
+Existing secrets remain:
+- GitHub Actions: `TELEGRAM_BOT_TOKEN`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID`, plus `WORKER_URL` and `CACHE_UPLOAD_SECRET`.
+- Cloudflare Worker: `TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, `ADMIN_SECRET`, `GITHUB_ACTIONS_TOKEN`, and `CACHE_UPLOAD_SECRET`.
 
-Cloudflare Worker secret:
-- `GITHUB_ACTIONS_TOKEN` — fine-grained PAT, restricted to this repository, with Actions: Read and write.
-
-The PNG renderer uses the Inter font files in `fonts/`.
-
-## Safe test notification
-
-Run `.github/workflows/test-change-notification.yml` manually with your own active Telegram chat ID. It reads the subscription and live schedule, flips one slot only in an in-memory copy, uses the same snapshot comparator and photo delivery helper as the production automatic alert, and sends exactly one clearly marked test PNG to that chat. It performs no writes to D1 and does not notify other users.
+## Free-plan constraints
+The uploader limits each PNG BLOB to 1.95 MB (D1's per-value limit is 2 MB). Each unique address/queue can cause up to 144 D1 row writes per day; monitor D1 row-write metrics as the public bot grows.

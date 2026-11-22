@@ -1,38 +1,21 @@
-# Cloudflare Worker — Telegram webhook
+# Cloudflare Worker — Telegram webhook, Cron and D1 PNG cache (no R2)
 
-This Worker handles Telegram messages/buttons immediately. Cloudflare Cron triggers the existing Python/GitHub Actions refresh workflow every 10 minutes. The latest rendered PNG and its predecessor are kept in a private R2 bucket (two objects per address/queue, overwritten on each refresh) so «📊 Мій графік» can return the current image without waiting for a new GitHub runner.
+This Worker handles Telegram messages/buttons, runs the background schedule trigger every 10 minutes, and returns the latest rendered PNG directly from D1.
 
-## Create D1 and deploy
+## Existing binding
+- `DB`: the existing D1 database `toe-public-bot-db`.
+- `schedule_images`: two PNG BLOB versions per unique address/queue.
 
+## Update steps
 1. Install Node.js LTS.
-2. In this directory, run `npm install` and `npx wrangler login`.
-3. Run `npx wrangler d1 create toe-public-bot-db` and copy the returned `database_id` into `wrangler.toml`.
-4. Run `npx wrangler d1 execute toe-public-bot-db --remote --file=./schema.sql`.
-5. Run `npx wrangler secret put TELEGRAM_BOT_TOKEN` and paste the existing BotFather token.
-6. Generate two separate random values locally and set them using `npx wrangler secret put WEBHOOK_SECRET` and `npx wrangler secret put ADMIN_SECRET`.
-7. Run `npx wrangler deploy`.
-8. Register the webhook using the deployed worker URL:
+2. In this directory run `npm.cmd install` and `npx.cmd wrangler login`.
+3. Keep the existing `database_id` in `wrangler.toml`; do not create a new D1 database.
+4. Apply the additive schema:
+   ```powershell
+   npx.cmd wrangler d1 execute toe-public-bot-db --remote --file=./schema.sql
+   ```
+5. Set `CACHE_UPLOAD_SECRET` with `npx.cmd wrangler secret put CACHE_UPLOAD_SECRET`.
+6. Deploy with `npx.cmd wrangler deploy`.
+7. Add the same `CACHE_UPLOAD_SECRET` and `WORKER_URL` to GitHub Actions Secrets.
 
-PowerShell:
-
-```powershell
-$worker = "https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev"
-$admin = Read-Host "Paste ADMIN_SECRET"
-Invoke-RestMethod -Method Post -Uri "$worker/admin/register-webhook" -Headers @{ Authorization = "Bearer $admin" }
-Invoke-RestMethod -Method Get -Uri "$worker/health"
-```
-
-## Worker secrets
-
-- `TELEGRAM_BOT_TOKEN`
-- `WEBHOOK_SECRET` — Telegram webhook secret token (1–256 characters; use a random URL-safe string)
-- `ADMIN_SECRET` — protects the register-webhook endpoint; use a different random value
-
-Do not commit secrets to Git or put them in `wrangler.toml`.
-
-## D1 binding
-
-`wrangler.toml` binds D1 as `DB`. The schema is in `schema.sql`.
-
-
-For the Cron + private R2 cache migration and exact deployment steps, see [`SETUP_CF_CRON_R2_CACHE.md`](../SETUP_CF_CRON_R2_CACHE.md) in the repository root.
+See [SETUP_CF_CRON_D1_CACHE.md](../SETUP_CF_CRON_D1_CACHE.md) for the full migration guide.

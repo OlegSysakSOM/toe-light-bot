@@ -72,50 +72,72 @@ const ON_DEMAND_WORKFLOW = "on-demand-schedule.yml";
 const REFRESH_WORKFLOW = "check-schedule.yml";
 const CACHE_MAX_AGE_MS = 15 * 60 * 1000;
 
-function scheduleCacheKey(addressKey, group, slot = "latest") {
-  if (!["latest", "previous"].includes(slot)) throw new Error("Invalid schedule cache slot");
-  return `schedules/${encodeURIComponent(`${addressKey}|${group}`)}.${slot}.png`;
+function scheduleCacheKey(addressKey, group) {
+  return String(addressKey) + '|' + String(group);
 }
 
-async function sendPhoto(env, chatId, object, caption, user) {
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (Array.isArray(value)) return Uint8Array.from(value);
+  if (value && value.buffer instanceof ArrayBuffer) {
+    return new Uint8Array(value.buffer, value.byteOffset || 0, value.byteLength || value.buffer.byteLength);
+  }
+  return null;
+}
+
+async function sendPhoto(env, chatId, pngBytes, caption, user) {
+  const bytes = toUint8Array(pngBytes);
+  if (!bytes || bytes.length < 8) throw new Error('Cached PNG is empty or invalid');
   const form = new FormData();
-  form.append("chat_id", String(chatId));
-  form.append("caption", caption);
-  form.append("parse_mode", "HTML");
-  form.append("reply_markup", JSON.stringify(mainKeyboard(user)));
-  form.append("photo", new Blob([await object.arrayBuffer()], { type: "image/png" }), "schedule.png");
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
-    method: "POST",
+  form.append('chat_id', String(chatId));
+  form.append('caption', caption);
+  form.append('parse_mode', 'HTML');
+  form.append('reply_markup', JSON.stringify(mainKeyboard(user)));
+  form.append('photo', new Blob([bytes], { type: 'image/png' }), 'schedule.png');
+  const response = await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendPhoto', {
+    method: 'POST',
     body: form,
   });
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
-    throw new Error(`Telegram sendPhoto: ${payload.description || response.status}`);
+    throw new Error('Telegram sendPhoto: ' + (payload.description || response.status));
   }
   return payload.result;
 }
 
 async function sendCachedSchedule(env, user, chatId) {
-  if (!env.SCHEDULE_CACHE || !user.address_key || !user.group_name) return false;
-  let object = await env.SCHEDULE_CACHE.get(scheduleCacheKey(user.address_key, user.group_name, "latest"));
-  if (!object) object = await env.SCHEDULE_CACHE.get(scheduleCacheKey(user.address_key, user.group_name, "previous"));
-  if (!object) return false;
-  const cachedAtMs = Number(object.customMetadata?.cached_at_ms || 0);
+  if (!env.DB || !user.address_key || !user.group_name) return false;
+  const row = await env.DB.prepare(
+    'SELECT latest_png, latest_snapshot, latest_cached_at, latest_cached_at_ms FROM schedule_images WHERE cache_key = ?'
+  ).bind(scheduleCacheKey(user.address_key, user.group_name)).first();
+  if (!row) return false;
+  const png = toUint8Array(row.latest_png);
+  const cachedAtMs = Number(row.latest_cached_at_ms || 0);
   const age = Date.now() - cachedAtMs;
-  if (!Number.isFinite(cachedAtMs) || cachedAtMs <= 0 || age < -2 * 60 * 1000 || age > CACHE_MAX_AGE_MS) {
+  const validSignature = png && png.length >= 8 &&
+    png[0] === 137 && png[1] === 80 && png[2] === 78 && png[3] === 71 &&
+    png[4] === 13 && png[5] === 10 && png[6] === 26 && png[7] === 10;
+  if (!validSignature || !Number.isFinite(cachedAtMs) || cachedAtMs <= 0 ||
+      age < -2 * 60 * 1000 || age > CACHE_MAX_AGE_MS) {
     return false;
   }
-  const cachedAt = object.customMetadata?.cached_at || "нещодавно";
+  const cachedAt = row.latest_cached_at || 'нещодавно';
   const caption =
-    `⚡ <b>ГРАФІК ВІДКЛЮЧЕНЬ</b>\n` +
-    `📍 ${escapeHtml(user.address_label)}\n` +
-    `🔢 Черга: <b>${escapeHtml(user.group_name)}</b>\n` +
-    `🕒 Оновлено: <b>${escapeHtml(cachedAt)}</b> (Київ)\n\n` +
-    `📲 Актуальний графік із кешу.\nДжерело: poweron.toe.com.ua`;
-  await sendPhoto(env, chatId, object, caption, user);
+    '⚡ <b>ГРАФІК ВІДКЛЮЧЕНЬ</b>\n' +
+    '📍 ' + escapeHtml(user.address_label) + '\n' +
+    '🔢 Черга: <b>' + escapeHtml(user.group_name) + '</b>\n' +
+    '🕒 Оновлено: <b>' + escapeHtml(cachedAt) + '</b> (Київ)\n\n' +
+    '📲 Актуальний графік із кешу.\nДжерело: poweron.toe.com.ua';
+  await sendPhoto(env, chatId, png, caption, user);
+  if (row.latest_snapshot) {
+    await env.DB.prepare(
+      "UPDATE users SET snapshot = ?, last_ok = ?, fail_count = 0, error_notified = 0, " +
+      "no_schedule_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?"
+    ).bind(String(row.latest_snapshot), cachedAt, String(chatId)).run();
+  }
   return true;
 }
-
 async function dispatchScheduledRefresh(env) {
   const token = String(env.GITHUB_ACTIONS_TOKEN || "").trim();
   if (!token) throw new Error("Не налаштовано GITHUB_ACTIONS_TOKEN у Cloudflare Worker.");
@@ -433,53 +455,54 @@ export default {
     if (request.method === "GET" && url.pathname === "/health") {
       const row = await env.DB.prepare("SELECT COUNT(*) AS users FROM users").first();
       const idx = await env.DB.prepare("SELECT COUNT(*) AS records FROM address_index").first();
+      const cacheTable = await env.DB.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schedule_images'"
+      ).first();
       return Response.json({
         ok: true, users: row?.users || 0, address_records: idx?.records || 0,
-        cache_enabled: Boolean(env.SCHEDULE_CACHE), cron_enabled: true, version: "2.5.0",
+        cache_enabled: Boolean(cacheTable), cache_backend: "d1_blob",
+        cron_enabled: true, version: "2.6.0",
       });
     }
     if (request.method === "POST" && url.pathname === "/internal/cache-schedule") {
       const supplied = request.headers.get("authorization") || "";
-      if (!env.CACHE_UPLOAD_SECRET || supplied !== `Bearer ${env.CACHE_UPLOAD_SECRET}`) {
+      if (!env.CACHE_UPLOAD_SECRET || supplied !== "Bearer " + env.CACHE_UPLOAD_SECRET) {
         return new Response("unauthorized", { status: 401 });
       }
-      if (!env.SCHEDULE_CACHE) return Response.json({ ok: false, error: "R2 binding is missing" }, { status: 503 });
+      if (!env.DB) return Response.json({ ok: false, error: "D1 binding is missing" }, { status: 503 });
       try {
-        const body = await request.json();
+        const metadataHeader = request.headers.get("x-schedule-meta") || "";
+        if (!metadataHeader || metadataHeader.length > 20000) {
+          return Response.json({ ok: false, error: "Missing or oversized schedule metadata" }, { status: 400 });
+        }
+        const metadataBytes = Uint8Array.from(atob(metadataHeader), (character) => character.charCodeAt(0));
+        const body = JSON.parse(new TextDecoder().decode(metadataBytes));
         const addressKey = String(body.address_key || "").trim();
         const groupName = String(body.group_name || "").trim();
-        const base64 = String(body.png_base64 || "");
-        if (!addressKey || !groupName || !base64 || base64.length > 4 * 1024 * 1024) {
-          return Response.json({ ok: false, error: "Invalid cache payload" }, { status: 400 });
+        if (!addressKey || !groupName) {
+          return Response.json({ ok: false, error: "Invalid address or queue metadata" }, { status: 400 });
         }
-        const binary = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+        const binary = new Uint8Array(await request.arrayBuffer());
         const pngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
-        if (binary.length < 8 || !pngSignature.every((value, index) => binary[index] === value)) {
-          return Response.json({ ok: false, error: "Uploaded file is not a PNG" }, { status: 400 });
-        }
-        const latestKey = scheduleCacheKey(addressKey, groupName, "latest");
-        const previousKey = scheduleCacheKey(addressKey, groupName, "previous");
-        const priorLatest = await env.SCHEDULE_CACHE.get(latestKey);
-        if (priorLatest) {
-          await env.SCHEDULE_CACHE.put(previousKey, await priorLatest.arrayBuffer(), {
-            httpMetadata: priorLatest.httpMetadata,
-            customMetadata: priorLatest.customMetadata,
-          });
+        if (binary.length < 8 || binary.length > 1950000 || !pngSignature.every((value, position) => binary[position] === value)) {
+          return Response.json({ ok: false, error: "PNG is invalid or exceeds the 1.95 MB D1 BLOB safety limit" }, { status: 413 });
         }
         const snapshot = JSON.stringify(body.snapshot || {});
-        await env.SCHEDULE_CACHE.put(latestKey, binary, {
-          httpMetadata: { contentType: "image/png" },
-          customMetadata: {
-            address_label: String(body.address_label || "").slice(0, 500),
-            group_name: groupName.slice(0, 80),
-            cached_at: String(body.cached_at || "").slice(0, 32),
-            cached_at_ms: String(Number(body.cached_at_ms) || Date.now()),
-            snapshot: snapshot.slice(0, 2000),
-          },
-        });
-        return Response.json({ ok: true });
+        if (snapshot.length > 10000) return Response.json({ ok: false, error: "Schedule snapshot is too large" }, { status: 400 });
+        const cacheKey = scheduleCacheKey(addressKey, groupName);
+        const cachedAt = String(body.cached_at || "").slice(0, 32);
+        const cachedAtMs = Number(body.cached_at_ms) || Date.now();
+        const sql = "INSERT INTO schedule_images (cache_key, address_key, group_name, address_label, latest_png, latest_snapshot, latest_cached_at, latest_cached_at_ms, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+          "ON CONFLICT(cache_key) DO UPDATE SET previous_png = schedule_images.latest_png, previous_snapshot = schedule_images.latest_snapshot, " +
+          "previous_cached_at = schedule_images.latest_cached_at, previous_cached_at_ms = schedule_images.latest_cached_at_ms, " +
+          "latest_png = excluded.latest_png, latest_snapshot = excluded.latest_snapshot, " +
+          "latest_cached_at = excluded.latest_cached_at, latest_cached_at_ms = excluded.latest_cached_at_ms, " +
+          "address_label = excluded.address_label, updated_at = CURRENT_TIMESTAMP";
+        await env.DB.prepare(sql).bind(cacheKey, addressKey, groupName, String(body.address_label || "").slice(0, 500), binary, snapshot, cachedAt, cachedAtMs).run();
+        return Response.json({ ok: true, cache_backend: "d1_blob", bytes: binary.length });
       } catch (error) {
-        console.error("Schedule cache upload failed", error);
+        console.error("Schedule D1 cache upload failed", error);
         return Response.json({ ok: false, error: String(error?.message || error) }, { status: 400 });
       }
     }

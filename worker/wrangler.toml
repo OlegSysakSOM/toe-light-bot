@@ -7,12 +7,9 @@ binding = "DB"
 database_name = "toe-public-bot-db"
 database_id = "ed3f982f-6a73-4dfa-a57b-a03fdd1162f3"
 
-[[r2_buckets]]
-binding = "SCHEDULE_CACHE"
-bucket_name = "toe-public-schedule-cache"
-
 [triggers]
-crons = ["*/10 * * * *"]
+# Every 10 minutes at minute 00, 10, 20, 30, 40, 50 (UTC).
+crons = ["0,10,20,30,40,50 * * * *"]
 
 [observability]
 enabled = true

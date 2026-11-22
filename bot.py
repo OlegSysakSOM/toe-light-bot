@@ -491,7 +491,7 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
     active = [(chat_id, user) for chat_id, user in users.items()
               if user.get("active") and user.get("address_key") and user.get("group")]
     stats = {"active": len(active), "fetched": 0, "baselined": 0, "unchanged": 0,
-             "changed": 0, "sent": 0, "fetch_failed": 0, "send_failed": 0}
+             "changed": 0, "sent": 0, "fetch_failed": 0, "send_failed": 0, "cache_failed": 0}
     if not active:
         log.info("Немає активних підписок")
         return stats
@@ -522,9 +522,9 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
         snapshot = {day: item["slots"] for day, item in sorted(result.items())}
         previous = user.get("snapshot") or {}
 
-        # Refresh the shared R2 image cache on every successful check, even when the
-        # schedule has not changed. This lets the Telegram button return the latest
-        # rendered PNG immediately without waiting for a new GitHub runner.
+        # Refresh the shared D1 BLOB image cache on every successful check, even when
+        # schedule slots have not changed. This lets the Telegram button return the
+        # latest rendered PNG immediately without waiting for another GitHub runner.
         cached_png: bytes | None = None
         if image_cache is not None and identity not in cached_identities:
             cached_identities.add(identity)
@@ -534,7 +534,8 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
                 log.info("PNG-кеш оновлено: %s", identity)
             except Exception:
                 cached_png = None
-                log.exception("Не вдалося оновити PNG-кеш: %s", identity)
+                stats["cache_failed"] += 1
+                log.exception("Не вдалося оновити PNG-кеш у D1: %s", identity)
 
         # First successful fetch is a silent baseline: the first picture is requested by the user.
         if not previous:
@@ -573,9 +574,10 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
         store.save(state)
 
     log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, змінено=%d, "
-             "нових PNG=%d, помилок TOE=%d, помилок Telegram=%d",
+             "нових PNG=%d, помилок TOE=%d, помилок Telegram=%d, помилок кешу D1=%d",
              stats["active"], stats["fetched"], stats["baselined"], stats["unchanged"],
-             stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"])
+             stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"],
+             stats["cache_failed"])
     return stats
 
 

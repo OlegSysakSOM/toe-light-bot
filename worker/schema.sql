@@ -61,3 +61,21 @@ CREATE TABLE IF NOT EXISTS bot_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL DEFAULT ''
 );
+
+-- Two most recent rendered PNGs per unique address/queue. No R2 bucket required.
+CREATE TABLE IF NOT EXISTS schedule_images (
+  cache_key TEXT PRIMARY KEY,
+  address_key TEXT NOT NULL,
+  group_name TEXT NOT NULL,
+  address_label TEXT NOT NULL DEFAULT '',
+  latest_png BLOB NOT NULL,
+  previous_png BLOB,
+  latest_snapshot TEXT NOT NULL DEFAULT '{}',
+  previous_snapshot TEXT,
+  latest_cached_at TEXT NOT NULL DEFAULT '',
+  latest_cached_at_ms INTEGER NOT NULL DEFAULT 0,
+  previous_cached_at TEXT,
+  previous_cached_at_ms INTEGER,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_images_updated_at ON schedule_images(updated_at);

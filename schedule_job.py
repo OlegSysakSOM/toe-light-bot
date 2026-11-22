@@ -78,7 +78,7 @@ def main() -> None:
     cfg = SimpleNamespace(timezone=str(tz), schedule_check_interval_seconds=600)
     image_cache = ScheduleCacheUploader.from_env()
     stats = process_subscriptions(tg, state, cfg, tz, http, NoopStore(),
-                                  image_cache=image_cache.put if image_cache else None)
+                                  image_cache=image_cache.put)
 
     updates = []
     for chat_id, user in users.items():
@@ -110,13 +110,16 @@ def main() -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [checked_at],
     )
-    log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, зміни=%d, нові PNG=%d, помилки TOE=%d, помилки Telegram=%d, оновлено D1=%d, час=%s",
+    log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, зміни=%d, "
+             "нові PNG=%d, помилки TOE=%d, помилки Telegram=%d, помилки D1-кешу=%d, "
+             "оновлено D1=%d, час=%s",
              len(users), stats["fetched"], stats["baselined"], stats["unchanged"],
              stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"],
-             len(updates), checked_at)
-    if stats["fetch_failed"] or stats["send_failed"]:
+             stats["cache_failed"], len(updates), checked_at)
+    if stats["fetch_failed"] or stats["send_failed"] or stats["cache_failed"]:
         raise RuntimeError(
-            f"Помилки фонового оновлення: TOE={stats['fetch_failed']}, Telegram={stats['send_failed']}."
+            f"Помилки фонового оновлення: TOE={stats['fetch_failed']}, "
+            f"Telegram={stats['send_failed']}, D1-кеш={stats['cache_failed']}."
         )
 
 
