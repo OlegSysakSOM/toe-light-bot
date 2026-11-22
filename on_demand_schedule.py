@@ -15,6 +15,7 @@ from cloudflare_d1 import D1Client
 from render import render_schedule_png
 from telegram_api import Telegram
 from toe_api import fetch_schedule
+from schedule_cache import ScheduleCacheUploader
 
 log = logging.getLogger("on_demand_schedule")
 
@@ -52,6 +53,13 @@ def main() -> None:
 
     now = datetime.now(tz)
     png = render_schedule_png(schedules, address, group, now)
+    snapshot = {day: item["slots"] for day, item in sorted(schedules.items())}
+    cache = ScheduleCacheUploader.from_env()
+    if cache:
+        try:
+            cache.put(address_key, group, png, now, address, snapshot)
+        except Exception:
+            log.exception("Не вдалося оновити кеш PNG; продовжую надсилання користувачу.")
     caption = _caption(
         {"address_label": address, "group": group},
         now, "📲 <b>Актуальний графік — щойно отримано із сайту.</b>",
@@ -60,7 +68,6 @@ def main() -> None:
     message_id = tg.send_photo(chat_id, png, caption)
 
     # The manual image becomes the comparison baseline: no duplicate alert for the same data.
-    snapshot = {day: item["slots"] for day, item in sorted(schedules.items())}
     d1.query(
         "UPDATE users SET snapshot = ?, message_id = ?, last_ok = ?, fail_count = 0, "
         "error_notified = 0, no_schedule_notified = 0, updated_at = CURRENT_TIMESTAMP "
