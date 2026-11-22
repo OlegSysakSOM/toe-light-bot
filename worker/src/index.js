@@ -471,52 +471,42 @@ export default {
       }
       if (!env.DB) return Response.json({ ok: false, error: "D1 binding is missing" }, { status: 503 });
       try {
-        const body = await request.json();
+        const metadataHeader = request.headers.get("x-schedule-meta") || "";
+        if (!metadataHeader || metadataHeader.length > 20000) {
+          return Response.json({ ok: false, error: "Missing or oversized schedule metadata" }, { status: 400 });
+        }
+        const metadataBytes = Uint8Array.from(atob(metadataHeader), (character) => character.charCodeAt(0));
+        const body = JSON.parse(new TextDecoder().decode(metadataBytes));
         const addressKey = String(body.address_key || "").trim();
         const groupName = String(body.group_name || "").trim();
-        const base64 = String(body.png_base64 || "");
-        if (!addressKey || !groupName || !base64 || base64.length > 2_700_000) {
-          return Response.json({ ok: false, error: "Invalid cache payload" }, { status: 400 });
+        if (!addressKey || !groupName) {
+          return Response.json({ ok: false, error: "Invalid address or queue metadata" }, { status: 400 });
         }
-        const binary = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+        const binary = new Uint8Array(await request.arrayBuffer());
         const pngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
-        if (binary.length < 8 || binary.length > 1_950_000 ||
-            !pngSignature.every((value, position) => binary[position] === value)) {
+        if (binary.length < 8 || binary.length > 1950000 || !pngSignature.every((value, position) => binary[position] === value)) {
           return Response.json({ ok: false, error: "PNG is invalid or exceeds the 1.95 MB D1 BLOB safety limit" }, { status: 413 });
         }
         const snapshot = JSON.stringify(body.snapshot || {});
-        if (snapshot.length > 10_000) {
-          return Response.json({ ok: false, error: "Schedule snapshot is too large" }, { status: 400 });
-        }
+        if (snapshot.length > 10000) return Response.json({ ok: false, error: "Schedule snapshot is too large" }, { status: 400 });
         const cacheKey = scheduleCacheKey(addressKey, groupName);
         const cachedAt = String(body.cached_at || "").slice(0, 32);
         const cachedAtMs = Number(body.cached_at_ms) || Date.now();
-        await env.DB.prepare(`
-          INSERT INTO schedule_images (
-            cache_key, address_key, group_name, address_label,
-            latest_png, latest_snapshot, latest_cached_at, latest_cached_at_ms, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-          ON CONFLICT(cache_key) DO UPDATE SET
-            previous_png = schedule_images.latest_png,
-            previous_snapshot = schedule_images.latest_snapshot,
-            previous_cached_at = schedule_images.latest_cached_at,
-            previous_cached_at_ms = schedule_images.latest_cached_at_ms,
-            latest_png = excluded.latest_png,
-            latest_snapshot = excluded.latest_snapshot,
-            latest_cached_at = excluded.latest_cached_at,
-            latest_cached_at_ms = excluded.latest_cached_at_ms,
-            address_label = excluded.address_label,
-            updated_at = CURRENT_TIMESTAMP
-        `).bind(
-          cacheKey, addressKey, groupName, String(body.address_label || "").slice(0, 500),
-          binary, snapshot, cachedAt, cachedAtMs,
-        ).run();
+        const sql = "INSERT INTO schedule_images (cache_key, address_key, group_name, address_label, latest_png, latest_snapshot, latest_cached_at, latest_cached_at_ms, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) " +
+          "ON CONFLICT(cache_key) DO UPDATE SET previous_png = schedule_images.latest_png, previous_snapshot = schedule_images.latest_snapshot, " +
+          "previous_cached_at = schedule_images.latest_cached_at, previous_cached_at_ms = schedule_images.latest_cached_at_ms, " +
+          "latest_png = excluded.latest_png, latest_snapshot = excluded.latest_snapshot, " +
+          "latest_cached_at = excluded.latest_cached_at, latest_cached_at_ms = excluded.latest_cached_at_ms, " +
+          "address_label = excluded.address_label, updated_at = CURRENT_TIMESTAMP";
+        await env.DB.prepare(sql).bind(cacheKey, addressKey, groupName, String(body.address_label || "").slice(0, 500), binary, snapshot, cachedAt, cachedAtMs).run();
         return Response.json({ ok: true, cache_backend: "d1_blob", bytes: binary.length });
       } catch (error) {
         console.error("Schedule D1 cache upload failed", error);
         return Response.json({ ok: false, error: String(error?.message || error) }, { status: 400 });
       }
-    }    if (request.method === "POST" && url.pathname === "/telegram/webhook") {
+    }
+    if (request.method === "POST" && url.pathname === "/telegram/webhook") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) {
         return new Response("unauthorized", { status: 401 });
       }
