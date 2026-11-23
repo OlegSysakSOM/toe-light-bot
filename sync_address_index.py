@@ -64,6 +64,22 @@ def _chunks(items: list[tuple[str, ...]], size: int = 75):
         yield items[offset:offset + size]
 
 
+def diff_records(
+    prepared: list[tuple[str, ...]],
+    existing_rows: list[dict[str, Any]],
+) -> tuple[list[tuple[str, ...]], list[str], int]:
+    """Return changed/new rows, stale source IDs, and unchanged count."""
+    existing = {
+        str(row["source_id"]): tuple(str(row.get(column) or "") for column in COLUMNS)
+        for row in existing_rows
+    }
+    incoming = {row[0]: row for row in prepared}
+    unchanged = sum(1 for source_id, row in incoming.items() if existing.get(source_id) == row)
+    changed = [row for source_id, row in incoming.items() if existing.get(source_id) != row]
+    removed = sorted(set(existing) - set(incoming))
+    return changed, removed, unchanged
+
+
 def main() -> None:
     cache_path = Path(os.environ.get("ADDRESS_INDEX_FILE", ".cache/toe_address_index.json"))
     max_pages = int(os.environ.get("MAX_ADDRESS_PAGES", "600"))
@@ -78,15 +94,8 @@ def main() -> None:
         "SELECT source_id, city_id, city_name, city_norm, street_id, street_name, "
         "street_norm, building_names, group_gpv FROM address_index"
     )
-    existing = {
-        str(row["source_id"]): tuple(str(row.get(column) or "") for column in COLUMNS)
-        for row in existing_rows
-    }
-    incoming = {row[0]: row for row in prepared}
-
-    unchanged = sum(1 for source_id, row in incoming.items() if existing.get(source_id) == row)
-    changed = [row for source_id, row in incoming.items() if existing.get(source_id) != row]
-    removed = sorted(set(existing) - set(incoming))
+    changed, removed, unchanged = diff_records(prepared, existing_rows)
+    existing_ids = {str(row["source_id"]) for row in existing_rows}
 
     if not changed and not removed:
         log.info(
@@ -106,7 +115,7 @@ def main() -> None:
         f"ON CONFLICT(source_id) DO UPDATE SET {set_clause} WHERE {difference_clause}"
     )
 
-    inserted = sum(1 for row in changed if row[0] not in existing)
+    inserted = sum(1 for row in changed if row[0] not in existing_ids)
     updated = len(changed) - inserted
     statements: list[dict[str, Any]] = []
     for row in changed:
