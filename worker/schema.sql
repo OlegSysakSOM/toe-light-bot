@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_active ON users(active);
-CREATE INDEX IF NOT EXISTS idx_users_address ON users(address_key, group_name);
+DROP INDEX IF EXISTS idx_users_address;
 
 CREATE TABLE IF NOT EXISTS address_index (
   source_id TEXT PRIMARY KEY,
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS address_index (
   building_names TEXT NOT NULL,
   group_gpv TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_address_city_street ON address_index(city_name, street_name);
+DROP INDEX IF EXISTS idx_address_city_street;
 CREATE INDEX IF NOT EXISTS idx_address_city_norm ON address_index(city_norm);
 
 DROP TABLE IF EXISTS address_index_staging;
