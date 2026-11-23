@@ -26,6 +26,15 @@ class TelegramError(RuntimeError):
         ))
 
     @property
+    def permanent_chat_failure(self) -> bool:
+        """True when Telegram says this private destination cannot receive messages anymore."""
+        lower = self.description.lower()
+        return self.code == 403 and any(part in lower for part in (
+            "user is deactivated",
+            "bot was blocked by the user",
+        ))
+
+    @property
     def not_modified(self) -> bool:
         return "message is not modified" in self.description.lower()
 
