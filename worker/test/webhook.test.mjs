@@ -188,3 +188,50 @@ test("Wrangler uses the requested minute marks and has no R2 binding", () => {
   assert.match(config, /crons\s*=\s*\["0,10,20,30,40,50 \* \* \* \*"]\s*/);
   assert.doesNotMatch(config, /r2_buckets|SCHEDULE_CACHE/i);
 });
+
+
+test("cached My schedule avoids a redundant users UPDATE when snapshot is already current", async () => {
+  const oldFetch = globalThis.fetch;
+  const cachedAt = "22.11.2026 13:00";
+  const snapshot = '{"2026-11-22":"000"}';
+  const db = new FakeDB({
+    user: {
+      chat_id: "719882819", first_name: "Oleg", username: "test", active: 1, flow: null,
+      city_input: "", street_input: "", pending_matches: "[]",
+      address_key: "22016/40637/24", address_label: "Велика Лука · Франка · 24",
+      group_name: "5.1", snapshot, message_id: null, fail_count: 0,
+      error_notified: 0, no_schedule_notified: 0, last_ok: cachedAt,
+    },
+    image: {
+      latest_png: Array.from(PNG),
+      latest_snapshot: snapshot,
+      latest_cached_at: cachedAt,
+      latest_cached_at_ms: Date.now(),
+    },
+  });
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/sendPhoto")) {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 89 } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error("Unexpected network request: " + url);
+  };
+  try {
+    const request = new Request("https://example.workers.dev/telegram/webhook", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": "wh-secret" },
+      body: JSON.stringify({
+        update_id: 44,
+        message: { chat: { id: 719882819, type: "private" }, from: { first_name: "Oleg" }, text: "📊 Мій графік" },
+      }),
+    });
+    const response = await worker.fetch(request, {
+      DB: db, TELEGRAM_BOT_TOKEN: "bot-token", WEBHOOK_SECRET: "wh-secret",
+    });
+    assert.equal(response.status, 200);
+    assert.equal(db.writes.some((entry) => entry.sql.includes("UPDATE users SET snapshot")), false);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
