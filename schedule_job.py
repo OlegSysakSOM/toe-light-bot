@@ -111,12 +111,14 @@ def main() -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [checked_at],
     )
+    usage = d1.usage
     log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, зміни=%d, "
              "нові PNG=%d, помилки TOE=%d, помилки Telegram=%d, постійно недоступних чатів=%d, "
-             "помилки D1-кешу=%d, оновлено D1=%d, час=%s",
+             "помилки D1-кешу=%d, змінено користувачів D1=%d, D1 API queries=%d rows_read=%d rows_written=%d, час=%s",
              len(users), stats["fetched"], stats["baselined"], stats["unchanged"],
              stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"],
-             stats["permanent_chat_failures"], stats["cache_failed"], len(updates), checked_at)
+             stats["permanent_chat_failures"], stats["cache_failed"], len(updates),
+             usage["queries"], usage["rows_read"], usage["rows_written"], checked_at)
     if stats["fetch_failed"] or stats["send_failed"] or stats["cache_failed"]:
         raise RuntimeError(
             f"Помилки фонового оновлення: TOE={stats['fetch_failed']}, "
