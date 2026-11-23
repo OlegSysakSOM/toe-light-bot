@@ -85,14 +85,15 @@ def main() -> None:
         before = original[chat_id]
         # No-change image edits update the caption's timestamp but do not need
         # a D1 row write. Persist only subscription state transitions/data changes.
-        persisted_fields = ("snapshot", "message_id", "fail_count", "error_notified", "no_schedule_notified")
+        persisted_fields = ("active", "snapshot", "message_id", "fail_count", "error_notified", "no_schedule_notified")
         if all(user.get(field) == before.get(field) for field in persisted_fields):
             continue
         updates.append({
-            "sql": "UPDATE users SET snapshot = ?, message_id = ?, fail_count = ?, "
+            "sql": "UPDATE users SET active = ?, snapshot = ?, message_id = ?, fail_count = ?, "
                    "error_notified = ?, no_schedule_notified = ?, last_ok = ?, "
                    "updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?",
             "params": [
+                1 if user.get("active") else 0,
                 json.dumps(user.get("snapshot") or {}, ensure_ascii=False),
                 user.get("message_id"),
                 int(user.get("fail_count") or 0),
@@ -105,17 +106,14 @@ def main() -> None:
     for i in range(0, len(updates), 75):
         d1.batch(updates[i:i + 75])
     checked_at = datetime.now(tz).strftime("%d.%m.%Y %H:%M:%S")
-    d1.query(
-        "INSERT INTO bot_meta(key, value) VALUES ('last_schedule_check_at', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [checked_at],
-    )
+    usage = d1.usage
     log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, зміни=%d, "
-             "нові PNG=%d, помилки TOE=%d, помилки Telegram=%d, помилки D1-кешу=%d, "
-             "оновлено D1=%d, час=%s",
+             "нові PNG=%d, помилки TOE=%d, помилки Telegram=%d, постійно недоступних чатів=%d, "
+             "помилки D1-кешу=%d, змінено користувачів D1=%d, D1 API queries=%d rows_read=%d rows_written=%d, час=%s",
              len(users), stats["fetched"], stats["baselined"], stats["unchanged"],
              stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"],
-             stats["cache_failed"], len(updates), checked_at)
+             stats["permanent_chat_failures"], stats["cache_failed"], len(updates),
+             usage["queries"], usage["rows_read"], usage["rows_written"], checked_at)
     if stats["fetch_failed"] or stats["send_failed"] or stats["cache_failed"]:
         raise RuntimeError(
             f"Помилки фонового оновлення: TOE={stats['fetch_failed']}, "

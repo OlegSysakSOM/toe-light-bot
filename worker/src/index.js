@@ -53,6 +53,15 @@ async function telegram(env, method, body) {
   return payload.result;
 }
 
+function logD1Usage(label, result) {
+  const meta = result?.meta || {};
+  console.log("D1 usage", label, {
+    rows_read: Number(meta.rows_read || 0),
+    rows_written: Number(meta.rows_written || 0),
+    changes: Number(meta.changes || 0),
+  });
+}
+
 async function sendMessage(env, chatId, text, user, extra = {}) {
   return telegram(env, "sendMessage", {
     chat_id: chatId,
@@ -131,10 +140,20 @@ async function sendCachedSchedule(env, user, chatId) {
     '📲 Актуальний графік із кешу.\nДжерело: poweron.toe.com.ua';
   await sendPhoto(env, chatId, png, caption, user);
   if (row.latest_snapshot) {
-    await env.DB.prepare(
-      "UPDATE users SET snapshot = ?, last_ok = ?, fail_count = 0, error_notified = 0, " +
-      "no_schedule_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?"
-    ).bind(String(row.latest_snapshot), cachedAt, String(chatId)).run();
+    const latestSnapshot = String(row.latest_snapshot);
+    const currentSnapshot = JSON.stringify(user.snapshot || {});
+    const needsUserSync = currentSnapshot !== latestSnapshot ||
+      String(user.last_ok || "") !== String(cachedAt) ||
+      Number(user.fail_count || 0) !== 0 ||
+      Boolean(user.error_notified) ||
+      Boolean(user.no_schedule_notified);
+    if (needsUserSync) {
+      const result = await env.DB.prepare(
+        "UPDATE users SET snapshot = ?, last_ok = ?, fail_count = 0, error_notified = 0, " +
+        "no_schedule_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?"
+      ).bind(latestSnapshot, cachedAt, String(chatId)).run();
+      logD1Usage("sync cached user snapshot", result);
+    }
   }
   return true;
 }
@@ -237,7 +256,7 @@ async function getUser(env, chatId, message) {
 }
 
 async function saveUser(env, user) {
-  await env.DB.prepare(`
+  const result = await env.DB.prepare(`
     INSERT INTO users (
       chat_id, first_name, username, active, flow, city_input, street_input,
       pending_matches, address_key, address_label, group_name, snapshot,
@@ -260,6 +279,7 @@ async function saveUser(env, user) {
     Number(user.fail_count || 0), user.error_notified ? 1 : 0,
     user.no_schedule_notified ? 1 : 0, user.last_ok || "",
   ).run();
+  logD1Usage("save user", result);
 }
 
 async function addressMatches(env, city, street, building) {
@@ -274,6 +294,7 @@ async function addressMatches(env, city, street, building) {
     "SELECT source_id, city_id, city_name, city_norm, street_id, street_name, street_norm, building_names, group_gpv " +
     "FROM address_index WHERE city_norm >= ? AND city_norm < ? LIMIT 2000"
   ).bind(firstToken, `${firstToken}\uffff`).all();
+  logD1Usage("address lookup", result);
   const wanted = normalize(building);
   const matches = [];
   const seen = new Set();
@@ -461,7 +482,7 @@ export default {
       return Response.json({
         ok: true, users: row?.users || 0, address_records: idx?.records || 0,
         cache_enabled: Boolean(cacheTable), cache_backend: "d1_blob",
-        cron_enabled: true, version: "2.6.0",
+        cron_enabled: true, version: "2.6.1",
       });
     }
     if (request.method === "POST" && url.pathname === "/internal/cache-schedule") {
@@ -499,7 +520,8 @@ export default {
           "latest_png = excluded.latest_png, latest_snapshot = excluded.latest_snapshot, " +
           "latest_cached_at = excluded.latest_cached_at, latest_cached_at_ms = excluded.latest_cached_at_ms, " +
           "address_label = excluded.address_label, updated_at = CURRENT_TIMESTAMP";
-        await env.DB.prepare(sql).bind(cacheKey, addressKey, groupName, String(body.address_label || "").slice(0, 500), binary, snapshot, cachedAt, cachedAtMs).run();
+        const result = await env.DB.prepare(sql).bind(cacheKey, addressKey, groupName, String(body.address_label || "").slice(0, 500), binary, snapshot, cachedAt, cachedAtMs).run();
+        logD1Usage("cache schedule PNG", result);
         return Response.json({ ok: true, cache_backend: "d1_blob", bytes: binary.length });
       } catch (error) {
         console.error("Schedule D1 cache upload failed", error);
@@ -519,7 +541,8 @@ export default {
         }
         await handleUpdate(env, update, ctx);
         if (Number.isFinite(updateId)) {
-          await env.DB.prepare("INSERT OR IGNORE INTO processed_updates(update_id) VALUES (?)").bind(updateId).run();
+          const result = await env.DB.prepare("INSERT OR IGNORE INTO processed_updates(update_id) VALUES (?)").bind(updateId).run();
+          logD1Usage("processed Telegram update", result);
         }
         return Response.json({ ok: true });
       } catch (error) {

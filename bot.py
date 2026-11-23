@@ -491,7 +491,8 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
     active = [(chat_id, user) for chat_id, user in users.items()
               if user.get("active") and user.get("address_key") and user.get("group")]
     stats = {"active": len(active), "fetched": 0, "baselined": 0, "unchanged": 0,
-             "changed": 0, "sent": 0, "fetch_failed": 0, "send_failed": 0, "cache_failed": 0}
+             "changed": 0, "sent": 0, "fetch_failed": 0, "send_failed": 0,
+             "permanent_chat_failures": 0, "cache_failed": 0}
     if not active:
         log.info("Немає активних підписок")
         return stats
@@ -567,6 +568,22 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
             user["no_schedule_notified"] = False
             stats["sent"] += 1
             log.info("Нове PNG після зміни графіка: %s, message_id=%s", identity, message_id)
+        except TelegramError as exc:
+            if exc.permanent_chat_failure:
+                # Do not let one deleted/blocked Telegram account fail every
+                # scheduled refresh. Persist inactive state; /start can re-enable
+                # a user who later unblocks the bot.
+                user["active"] = False
+                user["fail_count"] = 0
+                stats["permanent_chat_failures"] += 1
+                log.warning(
+                    "Підписку призупинено: Telegram більше не приймає повідомлення для цього чату (%s)",
+                    exc.description,
+                )
+            else:
+                stats["send_failed"] += 1
+                log.exception("Не вдалося надіслати PNG після зміни графіка: %s", identity)
+                # Keep the old snapshot so the next cycle retries transient failures.
         except Exception:
             stats["send_failed"] += 1
             log.exception("Не вдалося надіслати PNG після зміни графіка: %s", identity)
@@ -574,10 +591,11 @@ def process_subscriptions(tg: Telegram, state: dict[str, Any], cfg: Any,
         store.save(state)
 
     log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, змінено=%d, "
-             "нових PNG=%d, помилок TOE=%d, помилок Telegram=%d, помилок кешу D1=%d",
+             "нових PNG=%d, помилок TOE=%d, помилок Telegram=%d, постійно недоступних чатів=%d, "
+             "помилок кешу D1=%d",
              stats["active"], stats["fetched"], stats["baselined"], stats["unchanged"],
              stats["changed"], stats["sent"], stats["fetch_failed"], stats["send_failed"],
-             stats["cache_failed"])
+             stats["permanent_chat_failures"], stats["cache_failed"])
     return stats
 
 
