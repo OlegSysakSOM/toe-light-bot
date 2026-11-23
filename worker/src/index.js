@@ -256,7 +256,7 @@ async function getUser(env, chatId, message) {
 }
 
 async function saveUser(env, user) {
-  await env.DB.prepare(`
+  const result = await env.DB.prepare(`
     INSERT INTO users (
       chat_id, first_name, username, active, flow, city_input, street_input,
       pending_matches, address_key, address_label, group_name, snapshot,
@@ -279,6 +279,7 @@ async function saveUser(env, user) {
     Number(user.fail_count || 0), user.error_notified ? 1 : 0,
     user.no_schedule_notified ? 1 : 0, user.last_ok || "",
   ).run();
+  logD1Usage("save user", result);
 }
 
 async function addressMatches(env, city, street, building) {
@@ -293,6 +294,7 @@ async function addressMatches(env, city, street, building) {
     "SELECT source_id, city_id, city_name, city_norm, street_id, street_name, street_norm, building_names, group_gpv " +
     "FROM address_index WHERE city_norm >= ? AND city_norm < ? LIMIT 2000"
   ).bind(firstToken, `${firstToken}\uffff`).all();
+  logD1Usage("address lookup", result);
   const wanted = normalize(building);
   const matches = [];
   const seen = new Set();
