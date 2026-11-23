@@ -1,4 +1,4 @@
-# TOE Public Bot 2.6.0 — Cloudflare Cron + D1 PNG cache (no R2)
+# TOE Public Bot 2.6.1 — Cloudflare Cron + D1 PNG cache (no R2)
 
 ## How it works
 - Cloudflare Cron dispatches the existing Python/GitHub Actions refresh at minute **00, 10, 20, 30, 40, 50** every hour.
@@ -19,4 +19,4 @@ Existing secrets remain:
 - Cloudflare Worker: `TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, `ADMIN_SECRET`, `GITHUB_ACTIONS_TOKEN`, and `CACHE_UPLOAD_SECRET`.
 
 ## Free-plan constraints
-The uploader limits each PNG BLOB to 1.95 MB (D1's per-value limit is 2 MB). Each unique address/queue can cause up to 144 D1 row writes per day; monitor D1 row-write metrics as the public bot grows.
+The uploader limits each PNG BLOB to 1.95 MB (D1's per-value limit is 2 MB). Address-directory sync compares all rows and writes only changed/new/deleted addresses; an unchanged weekly directory now performs zero D1 writes. Schedule jobs log actual D1 `rows_read` and `rows_written`. One deactivated/blocked Telegram account is automatically paused and no longer fails the whole refresh.
