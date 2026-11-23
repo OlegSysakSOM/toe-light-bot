@@ -19,3 +19,11 @@ This Worker handles Telegram messages/buttons, runs the background schedule trig
 7. Add the same `CACHE_UPLOAD_SECRET` and `WORKER_URL` to GitHub Actions Secrets.
 
 See [SETUP_CF_CRON_D1_CACHE.md](../SETUP_CF_CRON_D1_CACHE.md) for the full migration guide.
+
+
+## Version 2.6.1 — lower D1 write amplification
+
+- Removed secondary indexes not used by Worker queries and the obsolete address-index staging table.
+- Cached PNG requests avoid updating a user row when the snapshot/status is already current.
+- Worker logs D1 `rows_read` and `rows_written` metadata for cache and Telegram update writes.
+- See the root `CHANGELOG_2.6.1.md` for details.
