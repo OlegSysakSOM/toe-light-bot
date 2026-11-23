@@ -525,3 +525,84 @@ def test_shared_schedule_change_predicate_and_photo_sender():
     message_id = send_schedule_change_photo(tg, "12345", b"test-png", "test-caption")
     assert message_id == 4321
     assert tg.sent == [("12345", b"test-png", "test-caption")]
+
+
+
+def test_telegram_error_detects_permanently_unavailable_chats():
+    from telegram_api import TelegramError
+
+    assert TelegramError(403, "Forbidden: user is deactivated").permanent_chat_failure
+    assert TelegramError(403, "Forbidden: bot was blocked by the user").permanent_chat_failure
+    assert not TelegramError(429, "Too Many Requests").permanent_chat_failure
+    assert not TelegramError(500, "Internal Server Error").permanent_chat_failure
+
+
+def test_background_refresh_disables_deactivated_telegram_chat(monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+    import bot as bot_module
+    from telegram_api import TelegramError
+
+    class FakeTelegram:
+        def send_photo(self, *args):
+            raise TelegramError(403, "Forbidden: user is deactivated")
+
+    class FakeStore:
+        def save(self, state):
+            pass
+
+    tz = ZoneInfo("Europe/Kyiv")
+    day = datetime.now(tz).date().isoformat()
+    current = {day: {"slots": "1" + "0" * 47, "created": "changed"}}
+    monkeypatch.setattr(bot_module, "fetch_schedule", lambda *a, **k: current)
+    monkeypatch.setattr(bot_module, "render_schedule_png", lambda *a, **k: b"png")
+    state = {"users": {"deactivated-chat": {
+        "active": True,
+        "address_key": "22016/40637/24",
+        "group": "5.1",
+        "address_label": "Test address",
+        "snapshot": {day: "0" * 48},
+        "message_id": None,
+        "fail_count": 0,
+        "error_notified": False,
+    }}}
+
+    stats = bot_module.process_subscriptions(
+        FakeTelegram(), state, SimpleNamespace(), tz, object(), FakeStore()
+    )
+
+    assert state["users"]["deactivated-chat"]["active"] is False
+    assert stats["permanent_chat_failures"] == 1
+    assert stats["send_failed"] == 0
+    assert stats["sent"] == 0
+
+
+def test_address_directory_diff_skips_unchanged_rows_and_only_updates_changed():
+    from sync_address_index import COLUMNS, diff_records, prepare_records
+
+    source = [{
+        "id": 8950,
+        "city": {"id": 22016, "name": "Велика Лука"},
+        "street": {"id": 40637, "name": "вул. Івана Франка"},
+        "buildingNames": "1, 10, 24",
+        "chergGpv": "5.1",
+    }]
+    prepared, digest = prepare_records(source)
+    existing = [dict(zip(COLUMNS, prepared[0]))]
+
+    changed, removed, unchanged = diff_records(prepared, existing)
+    assert digest
+    assert changed == []
+    assert removed == []
+    assert unchanged == 1
+
+    changed_source = [{
+        **source[0],
+        "buildingNames": "1, 10, 24, 25",
+    }]
+    changed_prepared, changed_digest = prepare_records(changed_source)
+    changed_rows, removed_rows, unchanged_rows = diff_records(changed_prepared, existing)
+    assert changed_digest != digest
+    assert len(changed_rows) == 1
+    assert removed_rows == []
+    assert unchanged_rows == 0
