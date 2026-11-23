@@ -106,11 +106,6 @@ def main() -> None:
     for i in range(0, len(updates), 75):
         d1.batch(updates[i:i + 75])
     checked_at = datetime.now(tz).strftime("%d.%m.%Y %H:%M:%S")
-    d1.query(
-        "INSERT INTO bot_meta(key, value) VALUES ('last_schedule_check_at', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [checked_at],
-    )
     usage = d1.usage
     log.info("Фоновий цикл: активних=%d, перевірено=%d, baseline=%d, без змін=%d, зміни=%d, "
              "нові PNG=%d, помилки TOE=%d, помилки Telegram=%d, постійно недоступних чатів=%d, "
