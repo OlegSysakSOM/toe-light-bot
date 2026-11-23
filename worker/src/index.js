@@ -480,7 +480,7 @@ export default {
       return Response.json({
         ok: true, users: row?.users || 0, address_records: idx?.records || 0,
         cache_enabled: Boolean(cacheTable), cache_backend: "d1_blob",
-        cron_enabled: true, version: "2.6.0",
+        cron_enabled: true, version: "2.6.1",
       });
     }
     if (request.method === "POST" && url.pathname === "/internal/cache-schedule") {
