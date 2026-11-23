@@ -133,12 +133,6 @@ def main() -> None:
         d1.query(f"DELETE FROM address_index WHERE source_id IN ({marks})", batch_ids)
         deleted += len(batch_ids)
 
-    d1.query(
-        "INSERT INTO bot_meta(key, value) VALUES ('address_index_sha256', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE bot_meta.value IS NOT excluded.value",
-        [digest],
-    )
-
     count = d1.query("SELECT COUNT(*) AS total FROM address_index")
     total = int((count[0] or {}).get("total", 0))
     if total != len(prepared):
