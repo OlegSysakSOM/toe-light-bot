@@ -1,10 +1,13 @@
 """Minimal Cloudflare D1 REST API client used by GitHub scheduled jobs."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 import requests
+
+log = logging.getLogger(__name__)
 
 
 class D1Error(RuntimeError):
@@ -22,6 +25,9 @@ class D1Client:
             "https://api.cloudflare.com/client/v4/accounts/"
             f"{self.account_id}/d1/database/{self.database_id}/query"
         )
+        self.rows_read_total = 0
+        self.rows_written_total = 0
+        self.queries_total = 0
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {self.token}",
@@ -36,6 +42,21 @@ class D1Client:
         result = payload.get("result") or []
         return result if isinstance(result, list) else [result]
 
+    def _record_usage(self, results: list[dict[str, Any]]) -> None:
+        for item in results:
+            meta = item.get("meta") or {}
+            self.rows_read_total += int(meta.get("rows_read") or 0)
+            self.rows_written_total += int(meta.get("rows_written") or 0)
+        self.queries_total += len(results)
+
+    @property
+    def usage(self) -> dict[str, int]:
+        return {
+            "queries": self.queries_total,
+            "rows_read": self.rows_read_total,
+            "rows_written": self.rows_written_total,
+        }
+
     def query(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
         body: dict[str, Any] = {"sql": sql}
         if params is not None:
@@ -43,6 +64,7 @@ class D1Client:
         response = self.session.post(self.url, json=body, timeout=60)
         response.raise_for_status()
         result = self._check(response.json())
+        self._record_usage(result)
         if not result:
             return []
         first = result[0] or {}
@@ -53,4 +75,5 @@ class D1Client:
             return
         response = self.session.post(self.url, json={"batch": statements}, timeout=120)
         response.raise_for_status()
-        self._check(response.json())
+        result = self._check(response.json())
+        self._record_usage(result)
